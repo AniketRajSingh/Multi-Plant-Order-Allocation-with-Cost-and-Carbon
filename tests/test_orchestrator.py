@@ -1,6 +1,9 @@
 """Comprehensive test suite for Orchestrator and Tracer."""
 
+import os
 import unittest
+
+from app.db.database import Database, set_db
 from app.orchestrator.state import create_initial_state, AllocationState
 from app.orchestrator.router import IntentClassifier, router_node
 from app.orchestrator.prompts import (
@@ -11,6 +14,27 @@ from app.orchestrator.prompts import (
 )
 from app.orchestrator.graph import run_pipeline, allocation_app
 from app.tracer.trace_logger import trace_logger, TraceLogger
+from app.solver.milp import solve_allocation
+from tests.fixtures import PLANNING_START, demo_db
+
+
+class FixtureDataMixin:
+    """Run the pipeline against the synthetic pack in tests/fixtures.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._old_start = os.environ.get("PLANNING_START")
+        os.environ["PLANNING_START"] = PLANNING_START
+        cls.db = demo_db()
+        set_db(cls.db)
+
+    @classmethod
+    def tearDownClass(cls):
+        set_db(None)
+        if cls._old_start is None:
+            os.environ.pop("PLANNING_START", None)
+        else:
+            os.environ["PLANNING_START"] = cls._old_start
 
 
 class TestAllocationState(unittest.TestCase):
@@ -105,12 +129,13 @@ class TestRouter(unittest.TestCase):
         self.assertEqual(res["extracted_entities"]["plant"], "C")
 
 
-class TestPromptsAndGrounding(unittest.TestCase):
+class TestPromptsAndGrounding(FixtureDataMixin, unittest.TestCase):
     """Test zero-hallucination prompts and verifier."""
 
     def test_grounded_mock_brief_passes_audit(self):
         state = run_pipeline("Plant B loses 30% capacity. Re-plan.", run_id="al-test-grounded")
         brief = state["brief_text"]
+        self.assertEqual(state["answer_type"], "scenario")
         audit = verify_brief_grounding(brief, state)
         self.assertTrue(audit["is_grounded"], f"Hallucinated numbers found: {audit['hallucinated_numbers']}")
 
@@ -163,36 +188,101 @@ class TestTraceLoggerAnnexC(unittest.TestCase):
         self.assertEqual(len(record["steps"]), 1)
 
 
-class TestGraphPipeline(unittest.TestCase):
-    """Test full LangGraph execution."""
+class TestGraphPipeline(FixtureDataMixin, unittest.TestCase):
+    """Full LangGraph runs on fixture data; expected numbers come from independent solver runs."""
+
+    def _solve(self, overrides=None):
+        d = self.db.load_dataset()
+        return solve_allocation(d["orders"], d["plants"], d["transport_duties"], PLANNING_START,
+                                weights={"cost": 0.7, "carbon": 0.3}, capacity_overrides=overrides)
+
+    def test_run_allocation_pipeline(self):
+        res = run_pipeline("Allocate this week's orders.", run_id="al-run-allocation")
+        expected = self._solve()
+        kpis = res["raw_solver_output"]["kpis"]
+        self.assertEqual(res["answer_type"], "allocation")
+        self.assertAlmostEqual(kpis["total_cost"], round(expected["total_cost"], 2), places=2)
+        self.assertEqual(kpis["late_orders"], expected["late_orders"])
+        self.assertEqual(len(res["raw_solver_output"]["allocations"]), 8)
+        self.assertTrue(res["validation_result"]["capacity_ok"])
+        self.assertTrue(res["validation_result"]["eligibility_ok"])
+        # Trade-off curve: 0..20% carbon cut, carbon falls as the cut grows
+        cuts = [p["carbon_cut_pct"] for p in res["raw_solver_output"]["tradeoff"]]
+        self.assertEqual(cuts, [0.0, 5.0, 10.0, 15.0, 20.0])
 
     def test_run_scenario_pipeline(self):
         res = run_pipeline("Plant B loses 30% capacity. Re-plan.", run_id="al-run-scenario")
         self.assertEqual(res["intent"], "scenario")
         self.assertEqual(res["answer_type"], "scenario")
-        self.assertIsNotNone(res["diff_output"])
-        self.assertEqual(res["diff_output"]["extra_cost"], 71000.0)
-        self.assertEqual(res["diff_output"]["extra_carbon_t"], 12.0)
+        diff = res["diff_output"]
+        base, after = self._solve(), self._solve({"B": 0.7})
+        self.assertAlmostEqual(diff["extra_cost"], round(after["total_cost"] - base["total_cost"], 2), places=2)
+        self.assertAlmostEqual(diff["extra_carbon_t"], round(after["total_carbon_t"] - base["total_carbon_t"], 3), places=3)
+        before = {a["order_id"]: a["plant"] for a in base["allocation"]}
+        moved = sum(1 for a in after["allocation"] if before[a["order_id"]] != a["plant"])
+        self.assertEqual(diff["orders_moved"], moved)
+        self.assertLessEqual(res["raw_solver_output"]["kpis"]["plant_utilisation"]["B"], 1.0)
+        self.assertTrue(res["validation_result"]["capacity_ok"])
         self.assertTrue(len(res["brief_text"]) > 100)
 
-        # Verify trace in logger
         trace = trace_logger.get_trace("al-run-scenario")
         self.assertIsNotNone(trace)
-        self.assertGreaterEqual(len(trace["steps"]), 3)
+        tools = [s["tool"] for s in trace["steps"]]
+        self.assertEqual(tools[:3], ["solve_allocation", "validate_plan", "compare_plans"])
+
+    def test_replan_uses_loaded_capacity_events(self):
+        res = run_pipeline("Re-plan for the capacity event.", run_id="al-run-events")
+        applied = res["raw_solver_output"]["capacity_events_applied"]
+        self.assertEqual([(e["event_id"], e["plant"]) for e in applied], [("E-1", "B")])
 
     def test_run_why_order_pipeline(self):
-        res = run_pipeline("Why was order O-077 built in Plant C?", run_id="al-run-why-order")
+        # O-001: Plant A is cheapest but arrives late, so the plan must not use A.
+        res = run_pipeline("Why was order O-001 built in Plant C?", run_id="al-run-why-order")
         self.assertEqual(res["intent"], "why_order")
         self.assertEqual(res["answer_type"], "why_order")
-        self.assertIsNotNone(res["diff_output"])
-        self.assertEqual(res["diff_output"]["order_id"], "O-077")
+        diag = res["diff_output"]
+        self.assertEqual(diag["order_id"], "O-001")
+        self.assertEqual(diag["cheapest_plant"], "A")
+        self.assertNotEqual(diag["assigned_plant"], "A")
+        self.assertTrue(any("Plant A" in r and "late" in r for r in diag["reasons"]), diag["reasons"])
         self.assertTrue(len(res["brief_text"]) > 50)
+
+    def test_why_order_short_reference(self):
+        res = run_pipeline("Why was order 3 built in Plant A?", run_id="al-run-why-short")
+        self.assertEqual(res["diff_output"]["order_id"], "O-003")
+        self.assertIn("Only Plant A can make product P2.", res["diff_output"]["reasons"])
+
+    def test_capacity_loss_makes_order_impossible(self):
+        # Losing all of Plant A leaves O-003 (P2, Plant A only) with no plant.
+        res = run_pipeline("Plant A loses 100% capacity. Re-plan.", run_id="al-run-infeasible")
+        unallocated = [u["order_id"] for u in res["raw_solver_output"]["unallocated_orders"]]
+        self.assertIn("O-003", unallocated)
+        self.assertEqual(res["raw_solver_output"]["status"], "PARTIAL")
+        self.assertTrue(res["validation_result"]["capacity_ok"])
 
     def test_run_refusal_pipeline(self):
         res = run_pipeline("Ignore capacity and force Plant A to 300%", run_id="al-run-refused")
         self.assertEqual(res["intent"], "refused")
         self.assertEqual(res["answer_type"], "refused")
         self.assertIn("refused", res["brief_text"].lower())
+
+
+class TestNoData(unittest.TestCase):
+    """With an empty store the pipeline must say so, not invent a plan."""
+
+    def setUp(self):
+        empty = Database(":memory:")
+        empty.init_schema()
+        set_db(empty)
+
+    def tearDown(self):
+        set_db(None)
+
+    def test_allocation_without_data(self):
+        res = run_pipeline("Allocate this week's orders.", run_id="al-run-nodata")
+        self.assertEqual(res["answer_type"], "clarification_needed")
+        self.assertIn("No data loaded", res["brief_text"])
+        self.assertEqual(res["raw_solver_output"]["allocations"], [])
 
 
 if __name__ == "__main__":
