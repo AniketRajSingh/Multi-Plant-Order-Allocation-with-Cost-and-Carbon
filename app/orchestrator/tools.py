@@ -261,7 +261,17 @@ def solve_partial_allocation(
         terms = [float(cand.at[k, "qty"]) * x[k] for k in idx if k in x]
         if terms:
             prob += pulp.lpSum(terms) <= limits[key]
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+    try:
+        import highspy
+        solver = pulp.HiGHS(msg=False)
+    except Exception:
+        solver = pulp.PULP_CBC_CMD(msg=False)
+
+    try:
+        prob.solve(solver)
+    except Exception:
+        prob.solve(pulp.LpSolverDefault)
     if pulp.LpStatus[prob.status] != "Optimal":
         return None
 

@@ -1,0 +1,13 @@
+plant,destination,transport_cost_per_unit,transit_days,duty_pct,carbon_kg_per_unit
+A,Germany,9.8,7,0.0,2.1
+B,Germany,7.5,5,0.0,1.8
+C,Germany,9.9,3,0.0,1.2
+A,UK,10.5,6,0.05,2.4
+B,UK,8.2,5,0.05,2.0
+C,UK,10.0,4,0.05,1.5
+A,France,9.0,5,0.0,1.9
+B,France,7.8,4,0.0,1.7
+C,France,9.5,3,0.0,1.1
+A,Spain,11.0,6,0.0,2.2
+B,Spain,9.5,5,0.0,2.0
+C,Spain,10.5,4,0.0,1.4

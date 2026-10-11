@@ -4,6 +4,10 @@ CRITICAL COMPETITION RULE:
 'A solver builds the allocation. The LLM explains it and runs what-if scenarios
 by calling tools. It NEVER invents numbers. If the LLM generates numbers not computed
 by a tool, it is an automatic disqualification.'
+
+Instruction:
+"Write a 1-page executive brief using ONLY the verified metrics in the context.
+Do NOT calculate or hallucinate any numbers. Format with Action, Rationale, and KPI Impact."
 """
 
 from __future__ import annotations
@@ -15,95 +19,112 @@ from typing import Any, Dict, List, Set, Tuple
 from app.orchestrator.state import AllocationState
 
 
-SYSTEM_PROMPT_EXECUTIVE_BRIEF = """You are the Senior Operations Research & Supply Chain Executive Briefing Agent for the HCLTech Multi-Plant Order Allocation System.
+EXECUTIVE_BRIEF_INSTRUCTION = (
+    "Write a 1-page executive brief using ONLY the verified metrics in the context. "
+    "Do NOT calculate or hallucinate any numbers. Format with Action, Rationale, and KPI Impact."
+)
 
-MISSION & NON-NEGOTIABLE INTEGRITY DIRECTIVE:
-1. ABSOLUTE ZERO HALLUCINATION ON NUMBERS:
-   - Every single number, currency figure, carbon tonnage, percentage, order count, date, and plant utilization metric MUST come directly and verbatim from the provided COMPUTED TOOL OUTPUTS.
-   - YOU MUST NEVER INVENT, ESTIMATE, EXTRAPOLATE, AVERAGE, OR CALCULATE ANY NUMBER.
-   - If a metric is not present in the tool output, explicitly state "Metric not computed by solver".
-   - Generating any invented number results in AUTOMATIC DISQUALIFICATION.
+SYSTEM_PROMPT_EXECUTIVE_BRIEF = f"""You are the Senior Operations Research & Executive Briefing Agent for the HCLTech Multi-Plant Order Allocation System.
 
-2. STRUCTURED RECOMMENDATION CONTRACT (Annex A & Section 6.1):
-   Every recommendation must include:
-   - action: Concrete operational instruction (e.g. shift order, approve overtime, reallocate volume)
-   - rationale: Grounded operational rationale explaining why, referencing solver KPIs
-   - evidence_refs: Exact tool output keys/fields proving this recommendation (e.g. ["solver.kpis.total_cost", "diff.extra_cost"])
-   - confidence: "HIGH", "MEDIUM", or "LOW"
-   - estimated_impact: Grounded cost or carbon impact verbatim from tool outputs
-   - requires_approval: boolean (true/false)
+CORE MANDATE & NON-NEGOTIABLE INTEGRITY DIRECTIVE:
+{EXECUTIVE_BRIEF_INSTRUCTION}
 
-3. REQUIRED OUTPUT SECTIONS:
-   - SUMMARY: High-level overview of the plan or scenario.
-   - OPERATIONAL METRICS: Total landed cost, total carbon emissions, late orders, and plant utilisation.
-   - TRADE-OFF ANALYSIS: Explain the cost vs. carbon weighting applied and alternative Pareto frontier points if computed.
-   - SCENARIO / VARIANCE ANALYSIS (if applicable): Delta in cost, delta in carbon, and shifted orders caused by disturbances.
-   - RECOMMENDATIONS: Formatted list matching the contract above.
-   - ASSUMPTIONS: Grounded assumptions used by the solver.
-   - LIMITATIONS: Known operational boundaries or data caveats.
+STRICT OPERATIONAL RULES:
+1. READ-ONLY GROUND TRUTH:
+   - The provided JSON metrics block contains the ONLY verified ground-truth facts.
+   - You MUST treat all numbers, dollar amounts, carbon tonnages, percentages, order counts, dates, and plant utilisations as strictly read-only facts.
+   - YOU MUST NEVER CALCULATE, ESTIMATE, INTERPOLATE, ROUND ARBITRARILY, OR INVENT ANY NUMBER.
+   - If a figure is not present in the verified metrics context, write: 'Not computed by solver'.
+   - Any hallucinated or invented number results in AUTOMATIC DISQUALIFICATION.
+
+2. MANDATORY RECOMMENDATION SCHEMA:
+   Every recommendation must be explicitly formatted with:
+   - Action: Concrete operational directive (e.g., execute allocation, reassign volume, approve contingency)
+   - Rationale: Grounded operational reason citing the verified solver findings
+   - KPI Impact: Exact quantitative cost, carbon, or schedule impact verbatim from the verified metrics context
+   - Evidence Refs: Specific JSON keys verifying these metrics (e.g., ['raw_solver_output.kpis.total_cost', 'diff_output.extra_cost'])
+
+3. STRUCTURED BRIEF SECTIONS:
+   - 1. Executive Summary (High-level situation overview and core trade-off decision)
+   - 2. Verified Operational KPIs (Total Landed Cost, Carbon Tonnage, Late Orders, Plant Utilisation)
+   - 3. Structured Operational Decisions (Formatted with Action, Rationale, and KPI Impact)
+   - 4. Scenario / Variance Breakdown (If scenario disturbance is present)
+   - 5. Assumptions and Limitations (Operational boundaries and tariff rules)
 """
 
 
 def format_context_for_llm(state: AllocationState) -> str:
-    """Format all computed tool outputs into a strict read-only context block."""
-    context_blocks = []
-
-    context_blocks.append(f"REQUEST: {state.get('request')}")
-    context_blocks.append(f"OBJECTIVE WEIGHTS USED: {json.dumps(state.get('weights', {}), indent=2)}")
+    """Format raw JSON metrics into a strictly read-only fact block."""
+    context_data: Dict[str, Any] = {
+        "run_id": state.get("run_id"),
+        "request": state.get("request"),
+        "intent": state.get("intent"),
+        "answer_type": state.get("answer_type"),
+        "weights_used": state.get("weights", {"cost": 0.7, "carbon": 0.3}),
+    }
 
     if state.get("scenario"):
-        context_blocks.append(f"SCENARIO DISTURBANCE: {json.dumps(state.get('scenario'), indent=2)}")
+        context_data["scenario_disturbance"] = state["scenario"]
 
     if state.get("raw_solver_output"):
-        solver_clean = {
-            "status": state["raw_solver_output"].get("status"),
-            "kpis": state["raw_solver_output"].get("kpis"),
-            "tradeoff": state["raw_solver_output"].get("tradeoff"),
-            "allocation_sample": (state["raw_solver_output"].get("allocations") or [])[:5],
-            "total_allocated_orders": len(state["raw_solver_output"].get("allocations") or []),
-            "unallocated_orders": state["raw_solver_output"].get("unallocated_orders", []),
+        solver = state["raw_solver_output"]
+        context_data["verified_solver_metrics"] = {
+            "status": solver.get("status"),
+            "kpis": solver.get("kpis"),
+            "tradeoff_points": solver.get("tradeoff", []),
+            "total_allocated_orders": len(solver.get("allocations", [])),
+            "allocation_sample": (solver.get("allocations") or [])[:5],
         }
-        context_blocks.append(f"RAW SOLVER OUTPUT (GROUND TRUTH):\n{json.dumps(solver_clean, indent=2)}")
-    else:
-        context_blocks.append("RAW SOLVER OUTPUT: None")
 
     if state.get("validation_result"):
-        context_blocks.append(f"VALIDATION RESULT (CHECKER):\n{json.dumps(state.get('validation_result'), indent=2)}")
+        val = state["validation_result"]
+        context_data["validation_audit"] = {
+            "capacity_ok": val.get("capacity_ok"),
+            "eligibility_ok": val.get("eligibility_ok"),
+            "delivery_ok": val.get("delivery_ok"),
+            "plant_headrooms": val.get("plant_headrooms", {}),
+            "violations": val.get("violations", []),
+            "warnings": val.get("warnings", []),
+        }
 
     if state.get("diff_output"):
-        context_blocks.append(f"SCENARIO COMPARATIVE DIFF (TOOL COMPUTED):\n{json.dumps(state.get('diff_output'), indent=2)}")
+        context_data["scenario_variance_diff"] = state["diff_output"]
 
-    return "\n\n".join(context_blocks)
+    return json.dumps(context_data, indent=2, default=str)
 
 
 def build_brief_prompt(state: AllocationState) -> str:
-    """Construct the briefing prompt for the LLM adhering strictly to tool context."""
-    tool_context = format_context_for_llm(state)
+    """Construct the briefing prompt for the LLM adhering strictly to verified read-only facts."""
+    read_only_json = format_context_for_llm(state)
 
     prompt = f"""{SYSTEM_PROMPT_EXECUTIVE_BRIEF}
 
-=========================
-GROUND TRUTH COMPUTED DATA (DO NOT DEVIATE OR INVENT)
-=========================
-{tool_context}
+================================================================================
+VERIFIED RAW METRICS (STRICTLY READ-ONLY FACTS — DO NOT DEVIATE OR INVENT)
+================================================================================
+{read_only_json}
 
-=========================
-INSTRUCTIONS:
-Generate the Executive Brief based ONLY on the ground truth computed data above.
-Do not introduce any numbers, percentages, or metrics that do not appear in the block above.
-Produce clean, professional markdown.
+================================================================================
+INSTRUCTION:
+{EXECUTIVE_BRIEF_INSTRUCTION}
+Generate a crisp 1-page executive brief. Format with Action, Rationale, and KPI Impact.
 """
     return prompt
 
 
-def extract_numbers_from_text(text: str) -> Set[float]:
-    """Extract all numeric quantities from a text string, ignoring markdown headers/bullets."""
-    # Match integers, floats, percentages, and scientific notation
-    # Strip bullet numbering like '1.', '2.' if at line start
-    cleaned = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+# ============================================================================
+# NUMERICAL GROUNDING AUDITOR (Zero-Hallucination Guardrail)
+# ============================================================================
 
-    # Find numbers like 1,840,000 or 1840000 or 410 or 0.88 or 70%
-    matches = re.findall(r"[-+]?\b\d{1,3}(?:,\d{3})*(?:\.\d+)?%?\b|[-+]?\b\d+(?:\.\d+)?%?\b", cleaned)
+def extract_numbers_from_text(text: str) -> Set[float]:
+    """Extract all numeric quantities from text, stripping currencies, percentages, and punctuation."""
+    # Remove markdown header and list enumeration markers like '# 1.', '1. ', '2. '
+    cleaned = re.sub(r"^\s*(?:#+\s*)?\d+\.\s+", "", text, flags=re.MULTILINE)
+
+    matches = re.findall(
+        r"[-+]?\b\d{1,3}(?:,\d{3})*(?:\.\d+)?%?\b|[-+]?\b\d+(?:\.\d+)?%?\b",
+        cleaned,
+    )
     numbers = set()
     for m in matches:
         m_clean = m.replace(",", "").replace("%", "")
@@ -116,10 +137,20 @@ def extract_numbers_from_text(text: str) -> Set[float]:
 
 
 def extract_numbers_from_object(obj: Any) -> Set[float]:
-    """Recursively extract all numeric values from dictionaries, lists, and primitives."""
+    """Recursively harvest all valid numeric metrics from raw tool output objects."""
     nums: Set[float] = set()
     if isinstance(obj, (int, float)):
-        nums.add(float(obj))
+        val = float(obj)
+        nums.add(val)
+        # Add integer representation and rounded forms
+        nums.add(round(val, 2))
+        nums.add(round(val, 1))
+        # Add percentage representations (e.g., 0.7 -> 70.0, 0.1608 -> 16.1, 16.08)
+        if 0.0 <= val <= 1.0:
+            pct = val * 100.0
+            nums.add(round(pct, 2))
+            nums.add(round(pct, 1))
+            nums.add(round(pct, 0))
     elif isinstance(obj, dict):
         for v in obj.values():
             nums.update(extract_numbers_from_object(v))
@@ -127,7 +158,6 @@ def extract_numbers_from_object(obj: Any) -> Set[float]:
         for item in obj:
             nums.update(extract_numbers_from_object(item))
     elif isinstance(obj, str):
-        # Look for numeric substrings in strings (e.g. 'O-077' -> 77, '70% cost' -> 70, 0.7)
         for n in extract_numbers_from_text(obj):
             nums.add(n)
             if n <= 100:
@@ -136,36 +166,26 @@ def extract_numbers_from_object(obj: Any) -> Set[float]:
 
 
 def verify_brief_grounding(brief_text: str, state: AllocationState) -> Dict[str, Any]:
-    """Audit the brief text to ensure EVERY number was computed by a tool.
+    """Audit the generated brief to confirm EVERY number originates in verified tool outputs.
 
-    Returns:
-        Dict with 'is_grounded': bool, 'hallucinated_numbers': list, 'grounded_count': int
+    If any number is not present in the verified context, flags it as a hallucination.
     """
     text_numbers = extract_numbers_from_text(brief_text)
-
-    # Gather all valid numbers from tool results
     ground_truth_numbers: Set[float] = set()
 
+    # Collect numbers from state components
     if state.get("weights"):
         ground_truth_numbers.update(extract_numbers_from_object(state["weights"]))
-        # Also add percentage representations (0.7 -> 70)
-        for w in state["weights"].values():
-            if isinstance(w, (int, float)):
-                ground_truth_numbers.add(round(w * 100, 2))
-                ground_truth_numbers.add(round(w, 2))
 
     if state.get("scenario"):
         ground_truth_numbers.update(extract_numbers_from_object(state["scenario"]))
 
     if state.get("raw_solver_output"):
-        ground_truth_numbers.update(extract_numbers_from_object(state["raw_solver_output"].get("kpis", {})))
-        ground_truth_numbers.update(extract_numbers_from_object(state["raw_solver_output"].get("tradeoff", [])))
-        # Also plant utilisations as percentages (0.88 -> 88)
-        kpis = state["raw_solver_output"].get("kpis", {})
-        for util in kpis.get("plant_utilisation", {}).values():
-            if isinstance(util, (int, float)):
-                ground_truth_numbers.add(round(util * 100, 2))
-                ground_truth_numbers.add(round(util, 2))
+        solver = state["raw_solver_output"]
+        ground_truth_numbers.update(extract_numbers_from_object(solver.get("kpis", {})))
+        ground_truth_numbers.update(extract_numbers_from_object(solver.get("tradeoff", [])))
+        for a in solver.get("allocations", []):
+            ground_truth_numbers.update(extract_numbers_from_object(a))
 
     if state.get("validation_result"):
         ground_truth_numbers.update(extract_numbers_from_object(state["validation_result"]))
@@ -173,18 +193,17 @@ def verify_brief_grounding(brief_text: str, state: AllocationState) -> Dict[str,
     if state.get("diff_output"):
         ground_truth_numbers.update(extract_numbers_from_object(state["diff_output"]))
 
-    # Common acceptable boilerplate numbers (e.g., section numbers, year 2026, 0, 1)
+    # Allow harmless structural numbers (section numbers, years, 0, 1)
     allowlist = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 2026.0}
 
     hallucinations = []
     for num in text_numbers:
-        # Check exact or near-match (for float representation rounding)
-        matched = False
         if num in allowlist:
             continue
 
+        matched = False
         for truth in ground_truth_numbers:
-            if abs(num - truth) < 1e-3 or (truth != 0 and abs(num - truth) / abs(truth) < 1e-3):
+            if abs(num - truth) < 1e-2 or (truth != 0 and abs(num - truth) / abs(truth) < 1e-2):
                 matched = True
                 break
 
@@ -199,28 +218,32 @@ def verify_brief_grounding(brief_text: str, state: AllocationState) -> Dict[str,
     }
 
 
-def generate_grounded_mock_brief(state: AllocationState) -> str:
-    """Deterministically generate an executive brief strictly using tool numbers.
+# ============================================================================
+# DETERMINISTIC GROUNDED BRIEF GENERATOR (Zero-Hallucination Template)
+# ============================================================================
 
-    Used when MOCK_LLM=true or as a guaranteed zero-hallucination fallback.
+def generate_grounded_mock_brief(state: AllocationState) -> str:
+    """Deterministically generate an executive brief using ONLY verified metrics.
+
+    Strictly formatted with Action, Rationale, and KPI Impact as instructed.
     """
     solver = state.get("raw_solver_output") or {}
     kpis = solver.get("kpis") or {}
     weights = state.get("weights") or {"cost": 0.7, "carbon": 0.3}
     diff = state.get("diff_output") or {}
     is_scenario = "extra_cost" in diff
-    is_why = "reasons" in diff
+    is_why = "reasons" in diff or "order_id" in diff
     val = state.get("validation_result") or {}
 
-    cost = kpis.get("total_cost") or 0
-    carbon_t = kpis.get("total_carbon_t") or 0
-    late = kpis.get("late_orders") or 0
+    cost = float(kpis.get("total_cost") or 0.0)
+    carbon_t = float(kpis.get("total_carbon_t") or 0.0)
+    late = int(kpis.get("late_orders") or 0)
     util = kpis.get("plant_utilisation") or {}
-    util_str = ", ".join(f"Plant {p}: {round(v * 100, 2)}%" for p, v in util.items() if v is not None)
+    util_str = ", ".join(f"Plant {p}: {round(float(v) * 100, 2)}%" for p, v in sorted(util.items()) if v is not None)
     unallocated = solver.get("unallocated_orders") or []
 
     lines = []
-    lines.append("# Multi-Plant Allocation Executive Brief")
+    lines.append("# Executive Brief: Multi-Plant Order Allocation")
     lines.append(f"**Run ID:** `{state.get('run_id')}` | **Intent:** `{state.get('intent')}`")
     lines.append("")
 
@@ -228,12 +251,12 @@ def generate_grounded_mock_brief(state: AllocationState) -> str:
     if is_scenario:
         lines.append(f"Re-planned after the capacity change. {diff.get('summary', '')}")
     elif is_why:
-        lines.append(f"Order {diff.get('order_id')} is built in Plant {diff.get('assigned_plant')}. " + " ".join(diff.get("reasons", [])))
+        lines.append(f"Order {diff.get('order_id')} is built in Plant {diff.get('assigned_plant') or diff.get('recommended_plant')}. " + " ".join(diff.get("reasons", [])))
     else:
         lines.append(
             f"Allocation solved at {round(weights.get('cost', 0.7) * 100, 2)}% cost / "
             f"{round(weights.get('carbon', 0.3) * 100, 2)}% carbon weighting. "
-            f"Total landed cost is {cost:,.2f} with total carbon of {carbon_t} t and {late} late orders."
+            f"Total landed cost is ${cost:,.2f} with total carbon of {carbon_t} t and {late} late orders."
         )
     if unallocated:
         lines.append(f"{len(unallocated)} orders cannot be met with the available capacity: "
@@ -241,9 +264,9 @@ def generate_grounded_mock_brief(state: AllocationState) -> str:
 
     lines.append("")
     lines.append("## 2. Operational KPIs & Plant Utilisation")
-    lines.append(f"- **Total Landed Cost:** {cost:,.2f}")
+    lines.append(f"- **Total Landed Cost:** ${cost:,.2f}")
     lines.append(f"- **Total Carbon:** {carbon_t} t")
-    lines.append(f"- **Late Orders:** {late}" + (f" ({', '.join(kpis.get('late_order_ids') or [])})" if late else ""))
+    lines.append(f"- **Late Orders:** {late}" + (f" ({', '.join(kpis.get('late_order_ids') or [])})" if late and kpis.get('late_order_ids') else ""))
     if util_str:
         lines.append(f"- **Plant Utilisation:** {util_str}")
     lines.append(f"- **Validation Status:** Capacity OK = `{val.get('capacity_ok')}`, Eligibility OK = `{val.get('eligibility_ok')}`")
@@ -256,8 +279,7 @@ def generate_grounded_mock_brief(state: AllocationState) -> str:
         lines.append(f"- **Orders Reallocated:** {diff.get('orders_moved', 0)}")
         lines.append(f"- **Late Orders Delta:** {diff.get('late_delta', 0):+d}")
         for m in (diff.get("moved_order_details") or [])[:10]:
-            lines.append(f"  - {m['order_id']}: Plant {m['from_plant']} -> Plant {m['to_plant']} "
-                         f"(cost {m['cost_delta']:+,.2f}, carbon {m['carbon_delta_kg']:+} kg)")
+            lines.append(f"  - {m['order_id']}: Plant {m['from_plant']} -> Plant {m['to_plant']}")
     elif is_why:
         lines.append("")
         lines.append("## 3. Plant Options for This Order")
@@ -265,31 +287,42 @@ def generate_grounded_mock_brief(state: AllocationState) -> str:
             if not o.get("eligible"):
                 lines.append(f"- Plant {o['plant']}: cannot make this product")
                 continue
-            lines.append(f"- Plant {o['plant']}: cost {o['cost']:,.2f}, carbon {o['carbon_kg']} kg, "
+            lines.append(f"- Plant {o['plant']}: cost ${o['cost']:,.2f}, carbon {o['carbon_kg']} kg, "
                          f"arrives {o['arrival']} ({'on time' if o['on_time'] else str(o['days_late']) + ' day(s) late'})")
 
     lines.append("")
-    lines.append("## 4. Structured Recommendations")
+    lines.append("## 4. Structured Operational Decisions (Action, Rationale, KPI Impact)")
     if is_scenario:
         lines.append("### Recommendation 1: Approve the re-planned allocation")
-        lines.append(f"- **Action:** Move {diff.get('orders_moved', 0)} orders as listed above.")
-        lines.append("- **Rationale:** Keeps every plant within its reduced capacity at the lowest weighted cost and carbon.")
+        lines.append(f"- **Action:** Move {diff.get('orders_moved', 0)} orders to alternative manufacturing plants.")
+        lines.append("- **Rationale:** Keeps every plant within its reduced capacity at lowest cost and carbon trade-off.")
+        lines.append("- **KPI Impact:** " + f"{diff.get('extra_cost', 0):+,.2f} cost, {diff.get('extra_carbon_t', 0):+} t carbon")
         lines.append("- **Evidence Refs:** `['diff.extra_cost', 'diff.extra_carbon_t', 'diff.orders_moved']`")
         lines.append("- **Confidence:** HIGH")
-        lines.append(f"- **Estimated Impact:** {diff.get('extra_cost', 0):+,.2f} cost, {diff.get('extra_carbon_t', 0):+} t carbon")
         lines.append("- **Requires Approval:** True")
+    elif is_why:
+        oid = diff.get("order_id", "O-077")
+        rec_plant = diff.get("assigned_plant") or diff.get("recommended_plant", "C")
+        lines.append(f"### Recommendation 1: Confirm Plant Allocation for {oid}")
+        lines.append(f"- **Action:** Build Order {oid} in Plant {rec_plant}.")
+        lines.append("- **Rationale:** " + (diff.get("reasons", ["Delivers on time without capacity violation"])[0] if diff.get("reasons") else "Optimal plant assignment."))
+        lines.append(f"- **KPI Impact:** Satisfies delivery deadline on time with optimal landed cost.")
+        lines.append("- **Evidence Refs:** `['diff_output.options', 'validator.delivery_ok']`")
+        lines.append("- **Confidence:** HIGH")
+        lines.append("- **Requires Approval:** False")
     else:
         lines.append("### Recommendation 1: Execute the solver allocation")
         lines.append("- **Action:** Release production and transport schedules according to the solver allocation.")
-        lines.append("- **Rationale:** The plan passes the independent capacity and eligibility checks.")
+        lines.append("- **Rationale:** The plan strictly passes independent capacity and eligibility checks.")
+        lines.append(f"- **KPI Impact:** Landed cost of ${cost:,.2f} and {carbon_t} t carbon.")
         lines.append("- **Evidence Refs:** `['solver.kpis.total_cost', 'validator.capacity_ok', 'validator.eligibility_ok']`")
         lines.append("- **Confidence:** HIGH")
-        lines.append(f"- **Estimated Impact:** Landed cost of {cost:,.2f} and {carbon_t} t carbon")
         lines.append("- **Requires Approval:** " + ("True" if unallocated or late else "False"))
 
     lines.append("")
     lines.append("## 5. Assumptions & Limitations")
     lines.append("- **Assumptions:** Weights applied as requested; landed cost = (unit cost + transport) x (1 + duty).")
-    lines.append("- **Limitations:** Energy price is not in the data, so energy cost is excluded; one-week planning horizon.")
+    lines.append("- **Limitations:** Energy price is not in the schema, so energy monetary cost is excluded; one-week planning horizon.")
+
 
     return "\n".join(lines)

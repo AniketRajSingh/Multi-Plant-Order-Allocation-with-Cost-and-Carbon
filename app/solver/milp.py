@@ -317,13 +317,21 @@ def _solve_model(
             )
         return prob
 
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_seconds)
+    try:
+        import highspy
+        solver = pulp.HiGHS(msg=False, timeLimit=time_limit_seconds)
+    except Exception:
+        solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_seconds)
+
     start = time.perf_counter()
     units_assigned_max: Optional[float] = None
     if allow_partial:
         phase1 = base_problem("max_units", pulp.LpMaximize)
         phase1 += pulp.LpAffineExpression([(x[k], qty[k]) for k in range(n) if allowed[k]]), "units"
-        phase1.solve(solver)
+        try:
+            phase1.solve(solver)
+        except Exception:
+            phase1.solve(pulp.LpSolverDefault)
         if _map_status(phase1) not in SUCCESS_STATUSES:
             solve_ms = (time.perf_counter() - start) * 1000.0
             return {"status": _map_status(phase1), "chosen": [], "unassigned": [], "extraction_problems": [], "objective_value": None,
@@ -343,7 +351,10 @@ def _solve_model(
             pulp.LpAffineExpression([(x[k], qty[k]) for k in range(n) if allowed[k]]) >= units_assigned_max - 0.5,
             "keep_max_units",
         )
-    problem.solve(solver)
+    try:
+        problem.solve(solver)
+    except Exception:
+        problem.solve(pulp.LpSolverDefault)
     solve_ms = (time.perf_counter() - start) * 1000.0
 
     status = _map_status(problem)

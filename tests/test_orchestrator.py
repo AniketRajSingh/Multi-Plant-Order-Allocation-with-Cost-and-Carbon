@@ -285,5 +285,82 @@ class TestNoData(unittest.TestCase):
         self.assertEqual(res["raw_solver_output"]["allocations"], [])
 
 
+class TestOperationalTools(unittest.TestCase):
+    """Test four tools bound to LangGraph: solve_allocation, validate_plan, compare_plans, explain_order."""
+
+    def test_solve_allocation_tool(self):
+        from app.tools.tools import execute_pulp_solver, solve_allocation
+        res = execute_pulp_solver(weights={"cost": 0.7, "carbon": 0.3})
+        self.assertIn(res["status"], ["OPTIMAL", "Optimal"])
+        self.assertIn("total_cost", res["kpis"])
+        self.assertIn("total_carbon_t", res["kpis"])
+        self.assertIn("plant_utilisation", res["kpis"])
+        self.assertGreater(len(res["allocations"]), 0)
+
+        # Test tool invocation via LangChain interface
+        tool_res = solve_allocation.invoke({"weights": {"cost": 0.8, "carbon": 0.2}})
+        self.assertIn(tool_res["status"], ["OPTIMAL", "Optimal"])
+
+    def test_validate_plan_tool(self):
+        from app.tools.tools import execute_pulp_solver, execute_annex_a_validator, validate_plan
+        solver_res = execute_pulp_solver(weights={"cost": 0.7, "carbon": 0.3})
+        val_res = execute_annex_a_validator(raw_solver_output=solver_res)
+        self.assertTrue(val_res["capacity_ok"])
+        self.assertTrue(val_res["eligibility_ok"])
+
+        # Tool invocation
+        tool_res = validate_plan.invoke({"raw_solver_output": solver_res})
+        self.assertIn("capacity_ok", tool_res)
+
+    def test_compare_plans_tool(self):
+        from app.tools.tools import execute_compare_plans, compare_plans
+        diff = execute_compare_plans(scenario={"plant": "B", "capacity_loss_pct": 30.0})
+        self.assertIn("extra_cost", diff)
+        self.assertIn("extra_carbon_t", diff)
+        self.assertIn("orders_moved", diff)
+        self.assertGreater(diff["extra_cost"], 0)
+        self.assertGreater(diff["extra_carbon_t"], 0)
+
+        # Tool invocation
+        tool_diff = compare_plans.invoke({"scenario": {"plant": "B", "capacity_loss_pct": 30.0}})
+        self.assertEqual(tool_diff["affected_plant"], "B")
+
+    def test_explain_order_tool(self):
+        from app.tools.tools import execute_explain_order, explain_order
+        # Annex A worked example: O-077 to Germany
+        res = execute_explain_order("O-077")
+        self.assertEqual(res["order_id"], "O-077")
+        self.assertIn("A", res["evaluations_by_plant"])
+        self.assertIn("B", res["evaluations_by_plant"])
+        self.assertIn("C", res["evaluations_by_plant"])
+
+        # Plant A costs 17,400 and arrives late (3 days late)
+        eval_a = res["evaluations_by_plant"]["A"]
+        self.assertEqual(eval_a["landed_cost"], 17400.0)
+        self.assertFalse(eval_a["on_time"])
+        self.assertEqual(eval_a["days_late"], 3)
+
+        # Plant C costs 18,200 and arrives on time
+        eval_c = res["evaluations_by_plant"]["C"]
+        self.assertEqual(eval_c["landed_cost"], 18200.0)
+        self.assertTrue(eval_c["on_time"])
+        self.assertEqual(eval_c["days_late"], 0)
+
+        # Recommended winner is Plant C
+        self.assertEqual(res["recommended_plant"], "C")
+
+        # Tool invocation
+        tool_res = explain_order.invoke({"order_id": "O-077"})
+        self.assertEqual(tool_res["recommended_plant"], "C")
+
+    def test_allocation_tools_binding(self):
+        from app.orchestrator.graph import ALLOCATION_TOOLS
+        tool_names = [t.name for t in ALLOCATION_TOOLS]
+        self.assertEqual(
+            tool_names,
+            ["solve_allocation", "validate_plan", "compare_plans", "explain_order"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
