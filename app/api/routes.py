@@ -363,7 +363,8 @@ def _llm_health() -> LLMHealth:
         return LLMHealth(status="ok" if has_key else "degraded", provider=provider, model=model, mock=False,
                          detail=None if has_key else f"{PROVIDER_KEYS[provider]} not set")
     if provider == "ollama":
-        base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+        from app.orchestrator.llm import get_ollama_base_url
+        base = get_ollama_base_url()
         try:
             with urllib.request.urlopen(f"{base}/api/tags", timeout=1.5) as resp:
                 ok = resp.status == 200
