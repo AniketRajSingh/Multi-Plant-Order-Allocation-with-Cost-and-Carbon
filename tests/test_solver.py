@@ -19,6 +19,7 @@ from app.solver.milp import (
     solve_allocation,
     validate_weights,
 )
+from app.solver.tradeoff import generate_tradeoff_curve, generate_weight_sweep
 from app.solver.validator import validate_plan
 
 PLANNING_DATE = "2026-10-12"
@@ -465,3 +466,63 @@ def test_validator_flags_inconsistent_reported_values(o077_data):
 def test_validator_rejects_bad_override(o077_data):
     with pytest.raises(DataValidationError):
         validate_plan([], *o077_data, PLANNING_DATE, capacity_overrides={"C": 1.2})
+
+
+# ============================================================================
+# tradeoff
+# ============================================================================
+
+def test_tradeoff_curve_structure_and_shared_baseline():
+    points = generate_tradeoff_curve(*_carbon_tradeoff_data(), PLANNING_DATE)
+    assert [p["carbon_cut_pct"] for p in points] == [0, 5, 10, 15, 20]
+    for p in points:
+        for key in ("carbon_cut_pct", "cost", "total_carbon_kg", "late_orders", "solver_status"):
+            assert key in p
+        assert p["solver_status"] == STATUS_OPTIMAL
+        assert p["baseline_carbon_kg"] == pytest.approx(400.0)  # one baseline for every point
+        assert p["total_carbon_kg"] <= p["carbon_cap_kg"] + 1e-6
+    # Each moved order saves 50 kg and costs +1000: 0/1/1/2/2 orders move.
+    assert [p["cost"] for p in points] == pytest.approx([4000, 5000, 5000, 6000, 6000])
+    assert [p["extra_cost_vs_baseline"] for p in points] == pytest.approx([0, 1000, 1000, 2000, 2000])
+    costs = [p["cost"] for p in points]
+    assert costs == sorted(costs)  # tighter caps never get cheaper
+    json.dumps(points)
+
+
+def test_tradeoff_curve_reports_infeasible_targets_without_values():
+    points = generate_tradeoff_curve(*_carbon_tradeoff_data(), PLANNING_DATE, carbon_cut_targets=[10, 60])
+    assert points[0]["solver_status"] == STATUS_OPTIMAL
+    assert points[1]["solver_status"] == STATUS_INFEASIBLE
+    assert points[1]["cost"] is None and points[1]["total_carbon_kg"] is None and points[1]["late_orders"] is None
+
+
+def test_tradeoff_curve_when_baseline_infeasible():
+    points = generate_tradeoff_curve(
+        *_two_plant_capacity_data(), PLANNING_DATE, carbon_cut_targets=[0, 10], capacity_overrides={"A": 0.0, "B": 0.5}
+    )
+    assert all(p["solver_status"] == STATUS_INFEASIBLE and p["cost"] is None for p in points)
+    assert all("Baseline" in p["reason"] for p in points)
+
+
+@pytest.mark.parametrize("bad", [[], [-5], [101], "10", None])
+def test_tradeoff_curve_rejects_invalid_targets(bad):
+    with pytest.raises(ValueError):
+        generate_tradeoff_curve(*_carbon_tradeoff_data(), PLANNING_DATE, carbon_cut_targets=bad)
+
+
+def test_weight_sweep_moves_along_frontier():
+    points = generate_weight_sweep(*_carbon_tradeoff_data(), PLANNING_DATE)
+    assert [p["carbon_weight"] for p in points] == pytest.approx([i / 10 for i in range(11)])
+    assert all(p["cost_weight"] == pytest.approx(1 - p["carbon_weight"]) for p in points)
+    carbons = [p["total_carbon_kg"] for p in points]
+    costs = [p["cost"] for p in points]
+    assert carbons == sorted(carbons, reverse=True)  # more carbon weight never raises carbon
+    assert costs == sorted(costs)
+    assert points[0]["total_carbon_kg"] == pytest.approx(400.0)  # cost-only: all on cheap plant A
+    assert points[-1]["total_carbon_kg"] == pytest.approx(200.0)  # carbon-only: all on green plant B
+
+
+@pytest.mark.parametrize("bad", [[-0.1], [1.5], [True], [float("nan")], []])
+def test_weight_sweep_rejects_invalid_weights(bad):
+    with pytest.raises(ValueError):
+        generate_weight_sweep(*_carbon_tradeoff_data(), PLANNING_DATE, carbon_weights=bad)
