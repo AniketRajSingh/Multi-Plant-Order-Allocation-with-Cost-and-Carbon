@@ -9,25 +9,10 @@
         "weights": {
           "cost": 0.7,
           "carbon": 0.3
-        },
-        "capacity_overrides": {
-          "B": 0.7
-        },
-        "planning_date": "2026-10-12",
-        "data_rows": {
-          "orders": 8,
-          "plants": 6,
-          "transport_duties": 9,
-          "capacity_events": 1
         }
       },
       "output": {
-        "status": "OPTIMAL",
-        "total_cost": 21775.0,
-        "total_carbon_t": 2.055,
-        "late_orders": 0,
-        "unallocated_orders": 0,
-        "solve_time_ms": 104.9
+        "status": "OPTIMAL"
       }
     },
     {
@@ -35,19 +20,15 @@
       "tool": "validate_plan",
       "output": {
         "capacity_ok": true,
-        "eligibility_ok": true,
-        "delivery_ok": true,
-        "violations": 0
+        "eligibility_ok": true
       }
     },
     {
       "agent": "scenario",
       "tool": "compare_plans",
       "output": {
-        "extra_cost": -300.0,
-        "extra_carbon_t": 0.175,
-        "orders_moved": 1,
-        "late_delta": 0
+        "extra_cost": 71000.0,
+        "extra_carbon_t": 12.0
       }
     },
     {
@@ -57,7 +38,7 @@
   ],
   "llm_calls": 1,
   "tokens": 1450,
-  "_created_at": 1791707178.972459,
+  "_created_at": 1791706522.6699378,
   "_token_breakdown": {
     "prompt_tokens": 950,
     "completion_tokens": 500

@@ -1,24 +1,18 @@
 {
   "run_id": "al-run-why-order",
-  "request": "Why was order O-001 built in Plant C?",
+  "request": "Why was order O-077 built in Plant C?",
   "steps": [
     {
       "agent": "diagnostician",
-      "tool": "diagnose_order",
+      "tool": "explain_order",
       "input": {
-        "order_ref": "O-001",
-        "asked_plant": "C"
+        "order_id": "O-077"
       },
       "output": {
-        "status": "OK",
-        "order_id": "O-001",
-        "assigned_plant": "C",
-        "cheapest_plant": "A",
-        "reasons": [
-          "Plant C is the lowest-carbon option at the chosen weights.",
-          "Plant A arrives 3 day(s) late, is cheaper by 1,500.00, emits 450.0 kg more carbon.",
-          "Plant B has only 50 spare units for 300 ordered, is cheaper by 750.00, emits 240.0 kg more carbon."
-        ]
+        "order_id": "O-077",
+        "recommended_plant": "C",
+        "recommended_cost": 18200.0,
+        "decision_rationale": "Plant C is selected. It meets delivery date on-time (2026-10-19 00:00:00) at lowest valid landed cost ($18,200.00)."
       }
     },
     {
@@ -26,9 +20,7 @@
       "tool": "validate_plan",
       "output": {
         "capacity_ok": true,
-        "eligibility_ok": true,
-        "delivery_ok": true,
-        "violations": 0
+        "eligibility_ok": true
       }
     },
     {
@@ -38,7 +30,7 @@
   ],
   "llm_calls": 1,
   "tokens": 1450,
-  "_created_at": 1791707179.9239786,
+  "_created_at": 1791706522.765165,
   "_token_breakdown": {
     "prompt_tokens": 950,
     "completion_tokens": 500

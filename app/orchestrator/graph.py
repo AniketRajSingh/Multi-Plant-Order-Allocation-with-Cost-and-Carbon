@@ -251,21 +251,19 @@ def writer_node(state: AllocationState) -> Dict[str, Any]:
         tokens_used = 1450
         trace_logger.record_llm_call(state["run_id"], tokens=tokens_used, prompt_tokens=950, completion_tokens=500)
     else:
-        # Real LLM call with bound tools context
+        # Invoke configured local Ollama LLM (http://192.168.3.173:11434)
         try:
-            if os.getenv("GEMINI_API_KEY"):
-                from langchain_google_genai import ChatGoogleGenerativeAI
-                llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.0)
-            else:
-                from langchain_openai import ChatOpenAI
-                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
-
-            response = llm.invoke(prompt)
-            brief_text = response.content if hasattr(response, "content") else str(response)
-            tokens_used = 1450
-            trace_logger.record_llm_call(state["run_id"], tokens=tokens_used, prompt_tokens=950, completion_tokens=500)
+            from app.orchestrator.llm import invoke_brief_llm
+            brief_text, usage = invoke_brief_llm(prompt)
+            tokens_used = usage.get("total_tokens", 1450)
+            trace_logger.record_llm_call(
+                state["run_id"],
+                tokens=tokens_used,
+                prompt_tokens=usage.get("prompt_tokens", 950),
+                completion_tokens=usage.get("completion_tokens", 500),
+            )
         except Exception as e:
-            logger.warning(f"LLM execution failed: {e}. Falling back to deterministic brief.")
+            logger.warning(f"Ollama LLM execution failed: {e}. Falling back to deterministic brief.")
             brief_text = generate_grounded_mock_brief(state)
             tokens_used = 1200
             trace_logger.record_llm_call(state["run_id"], tokens=tokens_used, prompt_tokens=800, completion_tokens=400)
