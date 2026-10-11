@@ -4,6 +4,30 @@ Every change Claude Code makes in this repo is listed here, newest first, with w
 
 ---
 
+## 2026-10-11: Fix orchestrator tests to use real data, then push
+
+**Asked for:** fix the 2 failing tests, commit, push.
+
+### Changes
+- `tests/test_orchestrator.py`: added a `FixtureDataMixin` that loads `tests/fixtures.demo_db()` through `set_db()` and sets `PLANNING_START=2026-10-12`. The pipeline and grounding tests now run on that data.
+- I replaced the hard-coded expectations (`extra_cost == 71000`, `extra_carbon_t == 12`, order `O-077`) with values from **independent solver runs**. Each test calls `solve_allocation` directly on the same tables and compares the result with the pipeline's output.
+- New tests:
+  - allocation KPIs and trade-off points (0–20%)
+  - a "re-plan" with no plant given applies the loaded event E-1
+  - why-order for O-001: A is cheapest but late, so A is not chosen
+  - "order 3" resolves to O-003 and gets the single-plant reason
+  - Plant A −100% leaves O-003 unmet (PARTIAL plan; capacity still respected)
+  - an empty database gives `clarification_needed`, not invented numbers
+- `data/traces/al-run-*.json`, `al-test-grounded.json`: rewritten by the test run. They now hold real solver runs on the fixture data instead of hard-coded output.
+
+### Result worth knowing for Q&A
+On the fixture data, "Plant B loses 30%" gives **cost −300, carbon +0.175 t, 0 extra late orders**. O-005 moves from B to A, which is cheaper but dirtier. This is correct: the objective is 70% cost / 30% carbon. The base plan chose B for its lower carbon, so losing B's capacity worsens the weighted score while raw cost falls.
+
+### Verification
+- `python -m pytest tests -q`: **115 passed, 0 failed.**
+
+---
+
 ## 2026-10-11: Replace hard-coded orchestrator tools with Sunandini's solver + DuckDB data
 
 **Asked for:** fetch Sunandini's commit and use the database instead of the hard-coded values.
