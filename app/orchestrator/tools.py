@@ -45,6 +45,16 @@ STATUS_PARTIAL = "PARTIAL"  # infeasible as asked; best subset of orders allocat
 PLANNING_HORIZON_DAYS = 7  # the solver plans one week
 
 
+#: Known model limits, reported with every plan (Section 6.1 "limitations").
+MODEL_LIMITATIONS: Tuple[str, ...] = (
+    "Energy cost is excluded from landed cost: plants.csv has no energy price per kWh.",
+    "One-week planning horizon; a capacity event overlapping the week applies to the whole week.",
+    "Carbon intensity is constant over the planning week.",
+    "Arrival = planning date + transit days; production lead time is not modelled.",
+    "Duty rates and transport costs are held constant for the period.",
+)
+
+
 class ToolDataError(Exception):
     """Input data is missing or unusable; the message is safe to show the user."""
 
@@ -188,6 +198,7 @@ def tool_solve_allocation(
         "planning_date": start.isoformat(),
         "weights_used": result["weights_used"],
         "assumptions": result["assumptions"],
+        "limitations": list(MODEL_LIMITATIONS),
         "data_rows": {t: int(len(df)) for t, df in data.items()},
         "solve_time_ms": _r(result["diagnostics"].get("total_ms"), 1),
         "solver_name": SOLVER_NAME,
@@ -311,6 +322,7 @@ def _no_plan(status, hints, result, applied, overrides, start, data) -> Dict[str
         "planning_date": start.isoformat(),
         "weights_used": result.get("weights_used", {}),
         "assumptions": result.get("assumptions", []),
+        "limitations": list(MODEL_LIMITATIONS),
         "data_rows": {t: int(len(df)) for t, df in data.items()},
         "solver_name": SOLVER_NAME,
     }

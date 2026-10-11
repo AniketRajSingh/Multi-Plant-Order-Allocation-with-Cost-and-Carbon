@@ -29,6 +29,7 @@ from app.api.schemas import (
     IngestResponse,
     LLMHealth,
     Recommendation,
+    SolverHealth,
     TraceResponse,
 )
 from app.db.database import Database, get_db
@@ -105,13 +106,13 @@ def build_analyze_response(state: Dict[str, Any], trace: Optional[Dict[str, Any]
         answer_type=answer_type,
         summary=_summary(answer_type, kpis, diff, unallocated, brief),
         allocation=solver.get("allocations") or [],
-        kpis=kpis,
+        kpis=kpis or {},
         tradeoff=solver.get("tradeoff") or [],
         weights_used={k: float(v) for k, v in weights.items() if v is not None},
-        validator=state.get("validation_result"),
-        assumptions=_assumptions(weights, state.get("scenario")) + list(state.get("assumptions") or []),
-        limitations=list(state.get("limitations") or []),
-        recommendations=_recommendations(state.get("recommendations") or []),
+        validator=state.get("validation_result") or {},
+        assumptions=_assumptions(weights, state.get("scenario"), list(state.get("assumptions") or [])),
+        limitations=_limitations(solver),
+        recommendations=build_recommendations(answer_type, solver, state.get("validation_result") or {}, diff or {}),
         brief=brief,
         scenario_comparison=diff,
         unallocated_orders=unallocated,
@@ -154,26 +155,120 @@ def _summary(
     return text
 
 
-def _assumptions(weights: Dict[str, Any], scenario: Optional[Dict[str, Any]]) -> List[str]:
+def _assumptions(weights: Dict[str, Any], scenario: Optional[Dict[str, Any]], solver_assumptions: List[str]) -> List[str]:
     out = []
-    if weights:
+    # The solver states the (normalised) weights itself; only add them when it did not run.
+    if weights and not any(a.startswith("Weights ") for a in solver_assumptions):
         out.append("Weights " + ", ".join(f"{float(v) * 100:g}% {k}" for k, v in weights.items() if v is not None))
     if scenario and scenario.get("plant"):
         text = f"Scenario: Plant {scenario['plant']} loses {scenario.get('capacity_loss_pct', '?')}% capacity"
         if scenario.get("from_date") or scenario.get("to_date"):
             text += f" from {scenario.get('from_date', 'start')} to {scenario.get('to_date', 'end of horizon')}"
         out.append(text)
+    if "lateness" in (weights or {}):
+        out.append("Lateness weight is reported but not used: the solver minimises late orders before cost and carbon")
+    return out + solver_assumptions
+
+
+def _limitations(solver: Dict[str, Any]) -> List[str]:
+    out = list(solver.get("limitations") or [])
+    out += [f"Infeasibility: {h}" for h in solver.get("infeasibility_hints") or []]
     return out
 
 
-def _recommendations(raw: List[Dict[str, Any]]) -> List[Recommendation]:
-    out = []
-    for item in raw:
-        try:
-            out.append(Recommendation.model_validate(item))
-        except ValidationError as exc:
-            logger.warning("dropping recommendation missing contract fields: %s", exc.errors())
-    return out
+def build_recommendations(
+    answer_type: str,
+    solver: Dict[str, Any],
+    validator: Dict[str, Any],
+    diff: Dict[str, Any],
+) -> List[Recommendation]:
+    """Deterministic recommendations. Every figure is copied from a tool output named in evidence_refs."""
+    if answer_type in ("refused", "clarification_needed"):
+        return []
+    recs: List[Recommendation] = []
+    kpis = solver.get("kpis") or {}
+    unallocated = solver.get("unallocated_orders") or []
+    plan_valid = bool(validator.get("capacity_ok")) and bool(validator.get("eligibility_ok"))
+
+    if not solver.get("allocations"):
+        hints = solver.get("infeasibility_hints") or []
+        if hints:
+            recs.append(Recommendation(
+                action="Add capacity or relax due dates before re-planning",
+                rationale=" ".join(hints),
+                evidence_refs=["solver.status", "solver.infeasibility_hints"],
+                confidence="HIGH",
+                estimated_impact="No feasible plan exists with current capacity",
+                requires_approval=True,
+            ))
+        return recs
+
+    if diff.get("status") == "OK" and "extra_cost" in diff:
+        recs.append(Recommendation(
+            action=f"Approve the re-plan: move {diff['orders_moved']} orders between plants",
+            rationale=diff["summary"],
+            evidence_refs=["diff.extra_cost", "diff.extra_carbon_t", "diff.orders_moved", "diff.moved_order_details"],
+            confidence="HIGH" if plan_valid else "LOW",
+            estimated_impact=f"{diff['extra_cost']:+,.2f} cost, {diff['extra_carbon_t']:+g} t carbon, "
+                             f"{diff['late_delta']:+d} late orders",
+            requires_approval=True,
+        ))
+    elif "reasons" in diff and diff.get("assigned_plant"):
+        recs.append(Recommendation(
+            action=f"Keep order {diff['order_id']} in Plant {diff['assigned_plant']}",
+            rationale=" ".join(diff["reasons"]),
+            evidence_refs=["diagnosis.options", "diagnosis.reasons"],
+            confidence="HIGH",
+            estimated_impact=next(
+                (f"cost {o['cost']:,.2f}, carbon {o['carbon_kg']:g} kg"
+                 for o in diff.get("options", []) if o.get("plant") == diff["assigned_plant"]), "see options"),
+            requires_approval=False,
+        ))
+    else:
+        recs.append(Recommendation(
+            action="Release the solver allocation to production and transport scheduling",
+            rationale="Plan passes the independent capacity and eligibility checks." if plan_valid
+            else "Plan failed an independent check; see validator.violations before release.",
+            evidence_refs=["kpis.total_cost", "kpis.total_carbon_t", "validator.capacity_ok", "validator.eligibility_ok"],
+            confidence="HIGH" if plan_valid else "LOW",
+            estimated_impact=f"cost {kpis.get('total_cost', 0):,.2f}, carbon {kpis.get('total_carbon_t', 0):g} t",
+            requires_approval=not plan_valid,
+        ))
+
+    late_ids = kpis.get("late_order_ids") or []
+    if late_ids:
+        recs.append(Recommendation(
+            action=f"Tell customers of {len(late_ids)} late orders now: {', '.join(late_ids)}",
+            rationale="No eligible plant with spare capacity delivers these orders by their due date.",
+            evidence_refs=["kpis.late_orders", "kpis.late_order_ids", "validator.warnings"],
+            confidence="HIGH",
+            estimated_impact=f"{len(late_ids)} orders arrive after the due date",
+            requires_approval=True,
+        ))
+    if unallocated:
+        recs.append(Recommendation(
+            action=f"Escalate {len(unallocated)} orders that cannot be built: "
+                   + ", ".join(u["order_id"] for u in unallocated),
+            rationale="Remaining capacity at every eligible plant is used up; this is the closest feasible plan.",
+            evidence_refs=["solver.unallocated_orders", "solver.infeasibility_hints"],
+            confidence="HIGH",
+            estimated_impact=f"{sum(u['qty'] for u in unallocated)} units unserved",
+            requires_approval=True,
+        ))
+
+    greener = next((p for p in solver.get("tradeoff") or []
+                    if p.get("carbon_cut_pct") == 10 and p.get("cost") is not None), None)
+    if greener:
+        recs.append(Recommendation(
+            action="Option: cut carbon 10% against this plan's baseline",
+            rationale="Carbon-cut point from the solver's trade-off curve, same capacity and delivery rules.",
+            evidence_refs=["tradeoff[carbon_cut_pct=10]"],
+            confidence="MEDIUM",
+            estimated_impact=f"{greener['extra_cost_vs_baseline']:+,.2f} cost vs baseline, "
+                             f"{greener['late_orders']} late orders",
+            requires_approval=True,
+        ))
+    return recs
 
 
 # ============================================================================
@@ -230,10 +325,29 @@ def health(db: Database = Depends(get_db)) -> HealthResponse:
     except Exception as exc:
         data_store = DataStoreHealth(status="down", detail=str(exc), path=db.path)
 
+    solver = _solver_health()
     llm = _llm_health()
-    statuses = {data_store.status, llm.status}
+    statuses = {data_store.status, solver.status, llm.status}
     overall = "down" if "down" in statuses else "degraded" if "degraded" in statuses else "ok"
-    return HealthResponse(status=overall, api=ComponentHealth(status="ok"), data_store=data_store, llm=llm)
+    return HealthResponse(status=overall, api=ComponentHealth(status="ok"), data_store=data_store,
+                          solver=solver, llm=llm)
+
+
+def _solver_health() -> SolverHealth:
+    """The MILP needs PuLP with the LpVariable(cat=...) API (PuLP 4.0 removed it) and the CBC binary."""
+    try:
+        import pulp
+    except ImportError as exc:
+        return SolverHealth(status="down", name="PuLP/CBC", detail=f"PuLP not installed: {exc}")
+    version = getattr(pulp, "__version__", None)
+    try:
+        pulp.LpVariable("health_probe", cat=pulp.LpBinary)
+    except TypeError as exc:
+        return SolverHealth(status="down", name="PuLP/CBC", version=version,
+                            detail=f"incompatible PuLP API ({exc}); install pulp==2.9.0")
+    if not pulp.PULP_CBC_CMD(msg=False).available():
+        return SolverHealth(status="down", name="PuLP/CBC", version=version, detail="CBC binary not available")
+    return SolverHealth(status="ok", name="PuLP/CBC", version=version)
 
 
 def _llm_health() -> LLMHealth:
