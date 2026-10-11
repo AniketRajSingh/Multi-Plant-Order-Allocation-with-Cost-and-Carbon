@@ -151,7 +151,7 @@ def cost_model_assumptions(energy_cost_included: bool, weekly_carbon: bool) -> L
     if energy_cost_included:
         out.insert(0, "Landed cost = (unit_cost + energy_kwh_per_unit*energy_price_per_kwh + transport_cost_per_unit) * (1 + duty_pct/100).")
     else:
-        out.insert(0, "Landed cost = (unit_cost + transport_cost_per_unit) * (1 + duty_pct/100); energy cost NOT included because plants.csv has no energy_price_per_kwh column.")
+        out.insert(0, "Landed cost = (unit_cost + transport_cost_per_unit) * (1 + duty_pct/100); Energy monetary cost is NOT included: plants.csv has no energy_price_per_kwh column.")
     out.append(
         "Carbon intensity per plant and week from the weekly carbon table (plants.csv value where a week is missing)."
         if weekly_carbon else

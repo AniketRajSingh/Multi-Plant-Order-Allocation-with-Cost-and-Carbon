@@ -283,7 +283,7 @@ def _solve_model(
     allowed = ~late if require_on_time else np.ones(n, dtype=bool)
     w_cost = weights["cost"] / scales["cost_scale"]
     w_carbon = weights["carbon"] / scales["carbon_scale"]
-    w_tardy = _tardiness_weight(weekly)
+    w_tardy = _tardiness_weight(weekly) if lateness_penalty > 0 else 0.0
 
     order_rows = weekly.groupby("order_id", sort=False).indices
     inel_by_order: Dict[str, List[int]] = {}
@@ -595,7 +595,7 @@ def solve_allocation(
 
     planning = parse_planning_date(planning_date)
     candidates = calculate_candidate_metrics(orders_df, plants_df, tariffs_df, planning)
-    horizon = validate_horizon_weeks(horizon_weeks) if horizon_weeks is not None else default_horizon_weeks(candidates, planning)
+    horizon = validate_horizon_weeks(horizon_weeks) if horizon_weeks is not None else 1
     weekly = expand_to_weeks(candidates, planning, horizon, carbon_weekly)
     ineligible_pairs = list(candidates.loc[~candidates["eligible"], ["order_id", "plant"]].itertuples(index=False, name=None))
     orders = candidates.drop_duplicates("order_id")[["order_id", "product", "qty", "destination", "due"]]
