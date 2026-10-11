@@ -343,7 +343,7 @@ def diagnosis_node(state: AllocationState) -> Dict[str, Any]:
 
     return {
         "diff_output": diag_res,
-        "answer_type": "infeasible" if "infeasible" in req.lower() else "allocation",
+        "answer_type": "why_order" if state.get("intent") == "why_order" else ("infeasible" if "infeasible" in req.lower() else "allocation"),
         "trace_steps": current_steps,
     }
 
@@ -477,7 +477,7 @@ def select_next_node(state: AllocationState) -> Literal["refusal", "clarificatio
         return "refusal"
     elif intent == "clarification_needed":
         return "clarification"
-    elif intent == "diagnosis":
+    elif intent in ("diagnosis", "why_order"):
         return "diagnosis"
     else:
         return "optimiser"
