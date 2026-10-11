@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.pytest_cache/
+
+# DuckDB store is rebuilt by scripts/load_data.py
+data/*.duckdb
+data/*.duckdb.wal
