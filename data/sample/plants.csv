@@ -1,0 +1,7 @@
+plant,product,weekly_capacity,unit_cost,energy_kwh_per_unit,carbon_kg_per_kwh
+A,P1,1000,10.0,2.0,0.70
+B,P1,800,12.0,2.0,0.40
+C,P1,300,14.0,2.0,0.05
+A,P2,1000,20.0,3.0,0.70
+A,P3,1000,15.0,2.0,0.70
+B,P3,800,16.0,2.0,0.40
