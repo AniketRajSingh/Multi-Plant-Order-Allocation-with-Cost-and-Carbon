@@ -546,6 +546,13 @@ _db: Optional[Database] = None
 _db_lock = threading.Lock()
 
 
+def set_db(db: Optional[Database]) -> None:
+    """Swap the process-wide Database (tests, or pointing the API at another file)."""
+    global _db
+    with _db_lock:
+        _db = db
+
+
 def get_db() -> Database:
     """Process-wide Database (also the FastAPI dependency)."""
     global _db

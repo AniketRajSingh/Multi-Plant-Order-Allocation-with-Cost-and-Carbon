@@ -26,177 +26,43 @@ from app.orchestrator.prompts import (
 )
 from app.orchestrator.router import router_node
 from app.orchestrator.state import AllocationState, create_initial_state
+from app.orchestrator.tools import (
+    STATUS_DATA_ERROR,
+    ToolDataError,
+    tool_compare_plans,
+    tool_diagnose_order,
+    tool_solve_allocation,
+    tool_validate_plan,
+)
+from app.solver.cost_carbon import DataValidationError
 from app.tracer.trace_logger import trace_logger
 
 
 # ============================================================================
-# TOOL IMPLEMENTATIONS (Deterministic Operational Engines)
+# TOOL CALLS (deterministic; implemented in app.orchestrator.tools)
 # ============================================================================
 
-def tool_solve_allocation(
-    weights: Dict[str, float],
-    scenario: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Execute mathematical multi-objective allocation solver.
-
-    Computes landed cost, carbon footprint, and delivery timelines across
-    plants A, B, and C respecting capacity and eligibility rules.
-    """
-    cost_weight = weights.get("cost", 0.7)
-    carbon_weight = weights.get("carbon", 0.3)
-
-    # Base baseline figures modeled after realistic manufacturer data (Section 6.1)
-    base_cost = 1840000.0
-    base_carbon_t = 410.0
-    late_orders = 2
-
-    # Weight adjustment dynamics: higher carbon weight shifts volume to lower-carbon plants
-    if carbon_weight > 0.5:
-        # Green priority: lower carbon, slightly higher cost
-        base_cost += round((carbon_weight - 0.3) * 120000, 2)
-        base_carbon_t = max(340.0, round(base_carbon_t - (carbon_weight - 0.3) * 150, 1))
-
-    # Plant utilisation rates
-    plant_util = {"A": 0.88, "B": 0.74, "C": 0.95}
-
-    # If scenario capacity cut is present in solver run
-    if scenario and scenario.get("plant"):
-        affected_plant = scenario.get("plant", "B").upper()
-        loss_pct = float(scenario.get("capacity_loss_pct", 30)) / 100.0
-        # Reduce capacity and shift load to other plants
-        if affected_plant in plant_util:
-            plant_util[affected_plant] = round(max(0.0, plant_util[affected_plant] * (1.0 - loss_pct)), 2)
-        # Other plants absorb demand
-        for p in plant_util:
-            if p != affected_plant:
-                plant_util[p] = min(0.99, round(plant_util[p] + (loss_pct * 0.4), 2))
-
-    allocations = [
-        {
-            "order_id": "O-077",
-            "plant": "C",
-            "cost": 18200.0,
-            "carbon_kg": 3100.0,
-            "arrival": "2026-10-20",
-            "on_time": True,
-        },
-        {
-            "order_id": "O-078",
-            "plant": "A",
-            "cost": 24500.0,
-            "carbon_kg": 4200.0,
-            "arrival": "2026-10-22",
-            "on_time": True,
-        },
-        {
-            "order_id": "O-079",
-            "plant": "B" if not (scenario and scenario.get("plant") == "B") else "C",
-            "cost": 19800.0,
-            "carbon_kg": 2900.0,
-            "arrival": "2026-10-21",
-            "on_time": True,
-        },
-    ]
-
-    tradeoff = [
-        {"carbon_cut_pct": 0, "cost": 1840000, "late_orders": 2},
-        {"carbon_cut_pct": 10, "cost": 1912000, "late_orders": 3},
-        {"carbon_cut_pct": 20, "cost": 2045000, "late_orders": 5},
-    ]
-
-    return {
-        "status": "OPTIMAL",
-        "kpis": {
-            "total_cost": base_cost,
-            "total_carbon_t": base_carbon_t,
-            "late_orders": late_orders,
-            "plant_utilisation": plant_util,
-        },
-        "allocations": allocations,
-        "tradeoff": tradeoff,
-        "unallocated_orders": [],
-        "solve_time_ms": 42.5,
-        "solver_name": "MultiCriteriaSimplexSolver_v1",
-    }
+PLAN_ERRORS = (ToolDataError, DataValidationError, ValueError)
 
 
-def tool_validate_plan(
-    raw_solver_output: Dict[str, Any],
-    scenario: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Execute HCLTech Annex A validator rules on the solver output.
-
-    Checks:
-    - Capacity limit compliance per plant
-    - Product eligibility per plant
-    - Arrival dates vs due dates
-    """
-    status = raw_solver_output.get("status")
-    kpis = raw_solver_output.get("kpis", {})
-    plant_util = kpis.get("plant_utilisation", {})
-
-    capacity_ok = True
-    violations = []
-    for p, util in plant_util.items():
-        if util > 1.0:
-            capacity_ok = False
-            violations.append(f"Plant {p} utilisation {util*100:.1f}% exceeds 100% capacity limit")
-
-    eligibility_ok = True  # Verified by solver matrix
-    delivery_ok = (kpis.get("late_orders", 0) == 0)
-
-    return {
-        "capacity_ok": capacity_ok,
-        "eligibility_ok": eligibility_ok,
-        "delivery_ok": delivery_ok,
-        "violations": violations,
-        "warnings": [f"{kpis.get('late_orders', 0)} orders flagged as late arrivals"] if not delivery_ok else [],
-    }
+def _append_step(state: AllocationState, step: Dict[str, Any]) -> List[Dict[str, Any]]:
+    trace_logger.log_step(
+        run_id=state["run_id"],
+        agent=step["agent"],
+        tool=step["tool"],
+        input_data=step.get("input"),
+        output_data=step.get("output"),
+    )
+    steps = list(state.get("trace_steps") or [])
+    steps.append(step)
+    return steps
 
 
-def tool_compare_plans(
-    base_output: Dict[str, Any],
-    weights: Dict[str, float],
-    scenario: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Execute scenario comparator tool to measure variance against base plan.
-
-    Matches Annex C benchmark:
-    {"extra_cost": 71000, "extra_carbon_t": 12}
-    """
-    affected_plant = scenario.get("plant", "B")
-    loss_pct = scenario.get("capacity_loss_pct", 30.0)
-
-    # Calculate exact delta variance based on disturbance severity
-    scale = (loss_pct / 30.0)
-    extra_cost = round(71000.0 * scale, 2)
-    extra_carbon_t = round(12.0 * scale, 2)
-    orders_moved = int(14 * scale)
-
-    return {
-        "extra_cost": extra_cost,
-        "extra_carbon_t": extra_carbon_t,
-        "orders_moved": orders_moved,
-        "late_delta": 0,
-        "affected_plant": affected_plant,
-        "capacity_loss_pct": loss_pct,
-        "summary": f"Plant {affected_plant} capacity loss of {loss_pct}% redirected {orders_moved} orders. Extra cost: ${extra_cost:,.2f}, Extra carbon: {extra_carbon_t} t.",
-    }
-
-
-def tool_diagnose_order(
-    request: str,
-    raw_solver_output: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Diagnose constraint bottlenecks, late delivery, or infeasible orders."""
-    # Annex A worked example: Order O-077
-    return {
-        "order_id": "O-077",
-        "root_cause": "Cheapest Plant A misses customer due date by 3 days due to 7-day transit time.",
-        "cheapest_option": {"plant": "A", "cost": 17400.0, "transit_days": 7, "on_time": False},
-        "recommended_option": {"plant": "C", "cost": 18200.0, "transit_days": 3, "on_time": True},
-        "tradeoff_delta": {"added_cost": 800.0, "status": "ON_TIME_GUARANTEED"},
-    }
+def _plan_or_error(weights, scenario, use_loaded_events: bool) -> Dict[str, Any]:
+    try:
+        return tool_solve_allocation(weights, scenario, use_loaded_events=use_loaded_events)
+    except PLAN_ERRORS as exc:
+        return {"status": STATUS_DATA_ERROR, "error": str(exc), "kpis": {}, "allocations": [], "tradeoff": []}
 
 
 # ============================================================================
@@ -204,148 +70,138 @@ def tool_diagnose_order(
 # ============================================================================
 
 def optimiser_node(state: AllocationState) -> Dict[str, Any]:
-    """Optimiser agent calling solve_allocation tool."""
+    """Optimiser agent calling solve_allocation on the DuckDB data."""
     start_time = time.time()
     weights = state.get("weights") or {"cost": 0.7, "carbon": 0.3}
     scenario = state.get("scenario")
+    # A re-plan request with no explicit plant/event uses the loaded capacity_events.
+    use_events = state.get("intent") == "scenario" and not (scenario and (scenario.get("plant") or scenario.get("event_id")))
 
-    solver_res = tool_solve_allocation(weights, scenario)
+    solver_res = _plan_or_error(weights, scenario, use_events)
+    kpis = solver_res.get("kpis") or {}
 
-    # Record trace step matching Annex C:
-    # {"agent": "optimiser", "tool": "solve_allocation", "input": {"weights": ...}, "output": {"status": "OPTIMAL"}}
     step = {
         "agent": "optimiser",
         "tool": "solve_allocation",
-        "input": {"weights": weights},
-        "output": {"status": solver_res.get("status")},
+        "input": {
+            "weights": weights,
+            "capacity_overrides": solver_res.get("capacity_overrides"),
+            "planning_date": solver_res.get("planning_date"),
+            "data_rows": solver_res.get("data_rows"),
+        },
+        "output": {
+            "status": solver_res.get("status"),
+            "total_cost": kpis.get("total_cost"),
+            "total_carbon_t": kpis.get("total_carbon_t"),
+            "late_orders": kpis.get("late_orders"),
+            "unallocated_orders": len(solver_res.get("unallocated_orders") or []),
+            "solve_time_ms": solver_res.get("solve_time_ms"),
+            **({"error": solver_res["error"]} if solver_res.get("error") else {}),
+        },
         "duration_ms": round((time.time() - start_time) * 1000, 2),
     }
 
-    trace_logger.log_step(
-        run_id=state["run_id"],
-        agent=step["agent"],
-        tool=step["tool"],
-        input_data=step["input"],
-        output_data=step["output"],
-    )
-
-    current_steps = list(state.get("trace_steps") or [])
-    current_steps.append(step)
-
-    return {
+    updates: Dict[str, Any] = {
         "raw_solver_output": solver_res,
-        "trace_steps": current_steps,
+        "trace_steps": _append_step(state, step),
+        "assumptions": list(solver_res.get("assumptions") or []),
     }
+    if solver_res.get("unallocated_orders") and state.get("intent") != "scenario":
+        updates["answer_type"] = "infeasible"
+    return updates
 
 
 def checker_node(state: AllocationState) -> Dict[str, Any]:
-    """Checker agent calling validate_plan tool."""
+    """Checker agent: independent Annex A validation from the raw tables."""
     start_time = time.time()
     solver_out = state.get("raw_solver_output") or {}
-    scenario = state.get("scenario")
+    try:
+        val_res = tool_validate_plan(solver_out)
+    except PLAN_ERRORS as exc:
+        val_res = {"capacity_ok": None, "eligibility_ok": None, "delivery_ok": None,
+                   "violations": [f"validator could not run: {exc}"], "warnings": []}
 
-    val_res = tool_validate_plan(solver_out, scenario)
-
-    # Record trace step matching Annex C:
-    # {"agent": "checker", "tool": "validate_plan", "output": {"capacity_ok": true, "eligibility_ok": true}}
     step = {
         "agent": "checker",
         "tool": "validate_plan",
         "output": {
             "capacity_ok": val_res.get("capacity_ok"),
             "eligibility_ok": val_res.get("eligibility_ok"),
+            "delivery_ok": val_res.get("delivery_ok"),
+            "violations": len(val_res.get("violations") or []),
         },
         "duration_ms": round((time.time() - start_time) * 1000, 2),
     }
-
-    trace_logger.log_step(
-        run_id=state["run_id"],
-        agent=step["agent"],
-        tool=step["tool"],
-        input_data=None,
-        output_data=step["output"],
-    )
-
-    current_steps = list(state.get("trace_steps") or [])
-    current_steps.append(step)
-
-    return {
-        "validation_result": val_res,
-        "trace_steps": current_steps,
-    }
+    return {"validation_result": val_res, "trace_steps": _append_step(state, step)}
 
 
 def scenario_node(state: AllocationState) -> Dict[str, Any]:
-    """Scenario agent calling compare_plans tool."""
+    """Scenario agent: re-solves the base plan and compares it with the scenario plan."""
     start_time = time.time()
-    base_out = state.get("raw_solver_output") or {}
     weights = state.get("weights") or {"cost": 0.7, "carbon": 0.3}
-    scenario = state.get("scenario") or {"plant": "B", "capacity_loss_pct": 30.0}
+    try:
+        diff_res = tool_compare_plans(state.get("raw_solver_output") or {}, weights)
+    except PLAN_ERRORS as exc:
+        diff_res = {"status": STATUS_DATA_ERROR, "summary": f"Comparison failed: {exc}"}
 
-    diff_res = tool_compare_plans(base_out, weights, scenario)
-
-    # Record trace step matching Annex C:
-    # {"agent": "scenario", "tool": "compare_plans", "output": {"extra_cost": 71000, "extra_carbon_t": 12}}
     step = {
         "agent": "scenario",
         "tool": "compare_plans",
         "output": {
             "extra_cost": diff_res.get("extra_cost"),
             "extra_carbon_t": diff_res.get("extra_carbon_t"),
+            "orders_moved": diff_res.get("orders_moved"),
+            "late_delta": diff_res.get("late_delta"),
         },
         "duration_ms": round((time.time() - start_time) * 1000, 2),
     }
-
-    trace_logger.log_step(
-        run_id=state["run_id"],
-        agent=step["agent"],
-        tool=step["tool"],
-        input_data=None,
-        output_data=step["output"],
-    )
-
-    current_steps = list(state.get("trace_steps") or [])
-    current_steps.append(step)
-
-    return {
-        "diff_output": diff_res,
-        "answer_type": "scenario",
-        "trace_steps": current_steps,
-    }
+    return {"diff_output": diff_res, "answer_type": "scenario", "trace_steps": _append_step(state, step)}
 
 
 def diagnosis_node(state: AllocationState) -> Dict[str, Any]:
-    """Diagnostician agent analyzing bottlenecks or infeasibilities."""
+    """Diagnostician agent: solves the plan, then explains one order's placement."""
     start_time = time.time()
     req = state.get("request", "")
-    solver_out = state.get("raw_solver_output")
+    target = state.get("diff_output") or {}
+    weights = state.get("weights") or {"cost": 0.7, "carbon": 0.3}
 
-    diag_res = tool_diagnose_order(req, solver_out)
+    plan = _plan_or_error(weights, state.get("scenario"), use_loaded_events=False)
+    if plan["status"] == STATUS_DATA_ERROR:
+        diag_res = {"status": STATUS_DATA_ERROR, "reasons": [plan["error"]]}
+    else:
+        try:
+            diag_res = tool_diagnose_order(target.get("order_id"), plan, asked_plant=target.get("target_plant"))
+        except PLAN_ERRORS as exc:
+            diag_res = {"status": STATUS_DATA_ERROR, "reasons": [str(exc)]}
 
     step = {
         "agent": "diagnostician",
         "tool": "diagnose_order",
-        "input": {"request": req},
-        "output": diag_res,
+        "input": {"order_ref": target.get("order_id"), "asked_plant": target.get("target_plant")},
+        "output": {k: diag_res.get(k) for k in ("status", "order_id", "assigned_plant", "cheapest_plant", "reasons")},
         "duration_ms": round((time.time() - start_time) * 1000, 2),
     }
 
-    trace_logger.log_step(
-        run_id=state["run_id"],
-        agent=step["agent"],
-        tool=step["tool"],
-        input_data=step["input"],
-        output_data=step["output"],
-    )
-
-    current_steps = list(state.get("trace_steps") or [])
-    current_steps.append(step)
-
     return {
+        "raw_solver_output": plan,
         "diff_output": diag_res,
         "answer_type": "why_order" if state.get("intent") == "why_order" else ("infeasible" if "infeasible" in req.lower() else "allocation"),
-        "trace_steps": current_steps,
+        "trace_steps": _append_step(state, step),
     }
+
+
+def no_plan_node(state: AllocationState) -> Dict[str, Any]:
+    """No plan could be produced: missing data, or infeasible even as a partial plan."""
+    solver = state.get("raw_solver_output") or {}
+    if solver.get("status") == STATUS_DATA_ERROR:
+        text = f"Cannot plan: {solver.get('error')}"
+        answer_type = "clarification_needed"
+    else:
+        hints = solver.get("infeasibility_hints") or ["no feasible allocation exists"]
+        text = f"No feasible plan (solver status {solver.get('status')}). " + " ".join(hints)
+        answer_type = "infeasible"
+    step = {"agent": "optimiser", "tool": "explain_no_plan", "output": {"status": solver.get("status")}}
+    return {"brief_text": text, "answer_type": answer_type, "trace_steps": _append_step(state, step)}
 
 
 def writer_node(state: AllocationState) -> Dict[str, Any]:
@@ -491,6 +347,12 @@ def route_after_checker(state: AllocationState) -> Literal["scenario", "writer"]
     return "writer"
 
 
+def route_after_optimiser(state: AllocationState) -> Literal["checker", "no_plan"]:
+    """Skip validation and writing when there is no plan at all."""
+    solver = state.get("raw_solver_output") or {}
+    return "checker" if solver.get("allocations") else "no_plan"
+
+
 def build_allocation_graph() -> StateGraph:
     """Build and compile the LangGraph StateMachine orchestrating the entire workflow."""
     workflow = StateGraph(AllocationState)
@@ -504,6 +366,7 @@ def build_allocation_graph() -> StateGraph:
     workflow.add_node("writer", writer_node)
     workflow.add_node("clarification", clarification_node)
     workflow.add_node("refusal", refusal_node)
+    workflow.add_node("no_plan", no_plan_node)
 
     # Connect edges
     workflow.add_edge(START, "router")
@@ -521,7 +384,7 @@ def build_allocation_graph() -> StateGraph:
     )
 
     # Core solver flow
-    workflow.add_edge("optimiser", "checker")
+    workflow.add_conditional_edges("optimiser", route_after_optimiser, {"checker": "checker", "no_plan": "no_plan"})
 
     # Conditional branch after checker
     workflow.add_conditional_edges(
@@ -543,6 +406,7 @@ def build_allocation_graph() -> StateGraph:
     workflow.add_edge("writer", END)
     workflow.add_edge("clarification", END)
     workflow.add_edge("refusal", END)
+    workflow.add_edge("no_plan", END)
 
     return workflow.compile()
 
