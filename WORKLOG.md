@@ -4,6 +4,32 @@ Every change Claude Code makes in this repo is listed here, newest first, with w
 
 ---
 
+## 2026-10-11: Complete the Section 6 contract (UNCOMMITTED: user said do not commit until told)
+
+**Asked for:** check the four endpoints against Section 6 and implement what is missing.
+
+### What was already in place
+- `POST /ingest` already accepted multipart `file` plus a `table` form field (or `metadata` JSON). It validates against Annex B and returns `table`, `rows_loaded`, `rows_rejected` and `status`. No change needed; added a test for the plain `table` field.
+- `GET /trace/{run_id}` already returned exactly `run_id`, `request`, `steps`, `llm_calls`, `tokens`.
+
+### Changes
+| File | Change |
+|---|---|
+| `app/api/routes.py` | **Recommendations:** this list was always empty. `build_recommendations()` now builds them from tool outputs, each with `action`, `rationale`, `evidence_refs`, `confidence`, `estimated_impact`, `requires_approval`. Cases: release the plan; approve a re-plan (moved orders, cost and carbon delta); keep the order in the plant (why-order); notify customers of late orders; escalate orders that cannot be built; a 10% carbon-cut option from the trade-off curve (only when that point is feasible); add capacity (no plan at all). Refused and clarification answers get none. **Limitations:** taken from the solver run plus any infeasibility hints. **Assumptions:** the weights line no longer appears twice, and a note is added when a lateness weight was sent but not used. `kpis` and `validator` are always objects, never `null`. **`/health`:** new `solver` check that PuLP supports the `LpVariable(cat=...)` call the MILP uses and that the CBC binary exists. It reports `down` with a fix hint on PuLP 4. |
+| `app/api/schemas.py` | Added `SolverHealth` and a `HealthResponse.solver` field. `KPIs.plant_utilisation` values can now be `null`. |
+| `app/orchestrator/tools.py` | Added `MODEL_LIMITATIONS`: energy cost excluded (no price in the data), one-week horizon, constant carbon intensity, no production lead time, constant duty and transport rates. These are returned with every plan. |
+| `tests/test_api.py` | New `TestAnalyzeWithData` class on the fixture pack. It checks: all 11 contract keys; all 6 recommendation keys; KPI and validator keys; trade-off points 0–20%; that weights 1/0 vs 0/1 change cost and carbon in the expected directions; scenario recommendation; escalation of the impossible order; why-order summary; refused answers have no recommendations; exact trace keys. `TestAPIContract` now also calls `set_db`, so the orchestrator never touches the real DB file during tests. |
+
+### Bug found and fixed
+- **A 100% capacity loss crashed `/analyze`** with a 500 error. The solver correctly reports `plant_utilisation = null` for a plant with zero capacity, but the schema only accepted numbers. Found by the new infeasible-order test.
+
+### Verification
+- `python -m pytest tests -q`: **123 passed, 0 failed.**
+- Ran `/analyze` on the fixture data through the API test client. The response matches Section 6.1. `/health` reported api, data_store, solver and llm all `ok`.
+- No "cut carbon 10%" recommendation appeared for the fixture data. Plant C, the low-carbon plant, is already at 100% utilisation, so the 10% point has no feasible plan; the recommendation is skipped rather than invented.
+
+---
+
 ## 2026-10-11: Fix orchestrator tests to use real data, then push
 
 **Asked for:** fix the 2 failing tests, commit, push.
