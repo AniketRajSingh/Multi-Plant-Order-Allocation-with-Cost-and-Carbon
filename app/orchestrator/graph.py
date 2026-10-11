@@ -237,9 +237,8 @@ def no_plan_node(state: AllocationState) -> Dict[str, Any]:
 def writer_node(state: AllocationState) -> Dict[str, Any]:
     """Writer agent generating zero-hallucination brief."""
     start_time = time.time()
-    mock_mode = os.getenv("MOCK_LLM", "false").lower() == "true" or not (
-        os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
-    )
+    from app.config import get_mock_llm
+    mock_mode = get_mock_llm()
 
     prompt = build_brief_prompt(state)
     brief_text = ""

@@ -50,8 +50,20 @@ PROVIDER_KEYS = {
 
 
 # ============================================================================
-# POST /analyze
+# /analyze
 # ============================================================================
+
+@router.get("/analyze")
+def analyze_info() -> Dict[str, Any]:
+    """Informational endpoint for browser GET navigation."""
+    return {
+        "status": "info",
+        "message": "POST required. The /analyze endpoint expects a POST request with a JSON body.",
+        "example_curl": "curl -X POST http://localhost:8000/analyze -H 'Content-Type: application/json' -d '{\"request\": \"Allocate this week orders\"}'",
+        "swagger_docs": "http://localhost:8000/docs",
+        "dashboard_ui": "http://localhost:8501",
+    }
+
 
 @router.post("/analyze", response_model=AnalyzeResponse, responses={500: {"model": ErrorResponse}})
 def analyze(body: AnalyzeRequest, db: Database = Depends(get_db)) -> AnalyzeResponse:

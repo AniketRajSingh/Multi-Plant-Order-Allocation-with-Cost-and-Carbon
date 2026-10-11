@@ -25,9 +25,54 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Inject crisp modern light-theme CSS
+st.markdown(
+    """
+    <style>
+        .stApp {
+            background-color: #FFFFFF;
+            color: #1E293B;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #F8FAFC !important;
+            border-right: 1px solid #E2E8F0;
+        }
+        .stMetric {
+            background-color: #F8FAFC;
+            border: 1px solid #E2E8F0;
+            border-radius: 8px;
+            padding: 12px 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+        }
+        div[data-testid="stMetricValue"] {
+            color: #0F172A !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="stMetricLabel"] {
+            color: #475569 !important;
+            font-weight: 600 !important;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 6px;
+            padding: 8px 16px;
+            background-color: #F1F5F9;
+        }
+        .stTabs [aria-selected="true"] {
+            background-color: #1D70B8 !important;
+            color: #FFFFFF !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # API base URL configuration from environment variable with fallback
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000")
-REQUEST_TIMEOUT_SECONDS = 10
+REQUEST_TIMEOUT_SECONDS = 90
+
 
 
 # ============================================================================

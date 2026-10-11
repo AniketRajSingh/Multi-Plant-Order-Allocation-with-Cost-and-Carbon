@@ -20,7 +20,7 @@ logger = logging.getLogger("orchestrator_llm")
 from app.config import get_llm_model as get_ollama_model, get_ollama_base_url
 
 
-def get_configured_llm(temperature: float = 0.0, timeout: float = 60.0) -> ChatOpenAI:
+def get_configured_llm(temperature: float = 0.0, timeout: float = 15.0) -> ChatOpenAI:
     """Instantiate ChatOpenAI client bound to Ollama instance."""
     base_url = f"{get_ollama_base_url()}/v1"
     model = get_ollama_model()
@@ -31,6 +31,7 @@ def get_configured_llm(temperature: float = 0.0, timeout: float = 60.0) -> ChatO
         model=model,
         temperature=temperature,
         timeout=timeout,
+        max_retries=0,
     )
 
 
