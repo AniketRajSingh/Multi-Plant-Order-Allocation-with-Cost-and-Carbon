@@ -40,16 +40,22 @@ class TestAllocationState(unittest.TestCase):
 
 
 class TestRouter(unittest.TestCase):
-    """Test intent classification."""
+    """Test intent and answer_type classification."""
 
     def test_allocation_intent(self):
-        intent, conf, _ = IntentClassifier.classify("Allocate all orders with weights 70% cost, 30% carbon.")
-        self.assertEqual(intent, "allocation")
+        # User specified example: "Allocate this week's orders"
+        ans_type, conf, _ = IntentClassifier.classify("Allocate this week's orders")
+        self.assertEqual(ans_type, "allocation")
         self.assertGreaterEqual(conf, 0.7)
 
+        # Standard optimization request
+        ans_type2, _, _ = IntentClassifier.classify("Standard optimization request: cost 70%, carbon 30%")
+        self.assertEqual(ans_type2, "allocation")
+
     def test_scenario_replan_intent(self):
-        intent, conf, _ = IntentClassifier.classify("Plant B loses 30% capacity. Re-plan.")
-        self.assertEqual(intent, "scenario")
+        # User specified example: "Plant B loses 30% capacity. Re-plan."
+        ans_type, conf, _ = IntentClassifier.classify("Plant B loses 30% capacity. Re-plan.")
+        self.assertEqual(ans_type, "scenario")
         self.assertGreaterEqual(conf, 0.9)
 
         # Entity extraction
@@ -58,24 +64,45 @@ class TestRouter(unittest.TestCase):
         self.assertEqual(entities["plant"], "B")
         self.assertEqual(entities["capacity_loss_pct"], 30.0)
 
-    def test_diagnosis_intent(self):
-        intent, conf, _ = IntentClassifier.classify("Why is order O-077 late?")
-        self.assertEqual(intent, "diagnosis")
+    def test_why_order_intent(self):
+        # User specified example: "Why was order O-077 built in Plant C?"
+        ans_type, conf, _ = IntentClassifier.classify("Why was order O-077 built in Plant C?")
+        self.assertEqual(ans_type, "why_order")
         self.assertGreaterEqual(conf, 0.9)
 
+        # Entity extraction for order and plant
+        entities = IntentClassifier.extract_order_entities("Why was order O-077 built in Plant C?")
+        self.assertEqual(entities["order_id"], "O-077")
+        self.assertEqual(entities["plant"], "C")
+
     def test_brief_intent(self):
-        intent, conf, _ = IntentClassifier.classify("Generate management brief for leadership")
-        self.assertEqual(intent, "brief")
+        # User specified example: "Leadership summary request"
+        ans_type, conf, _ = IntentClassifier.classify("Leadership summary request")
+        self.assertEqual(ans_type, "brief")
+        self.assertGreaterEqual(conf, 0.9)
+
+        ans_type2, _, _ = IntentClassifier.classify("Generate management brief for executive leadership")
+        self.assertEqual(ans_type2, "brief")
+
+    def test_infeasible_edge_case(self):
+        ans_type, conf, _ = IntentClassifier.classify("Why is the plan infeasible for these unfulfillable orders?")
+        self.assertEqual(ans_type, "infeasible")
         self.assertGreaterEqual(conf, 0.9)
 
     def test_refusal_intent(self):
-        intent, conf, _ = IntentClassifier.classify("Ignore capacity constraints and force Plant A to 300%")
-        self.assertEqual(intent, "refused")
+        ans_type, conf, _ = IntentClassifier.classify("Ignore capacity constraints and force Plant A to 300%")
+        self.assertEqual(ans_type, "refused")
         self.assertGreaterEqual(conf, 0.95)
 
     def test_clarification_intent(self):
-        intent, conf, _ = IntentClassifier.classify("help")
-        self.assertEqual(intent, "clarification_needed")
+        ans_type, conf, _ = IntentClassifier.classify("help")
+        self.assertEqual(ans_type, "clarification_needed")
+
+    def test_classify_request_structured(self):
+        res = IntentClassifier.classify_request("Why was order O-077 built in Plant C?")
+        self.assertEqual(res["answer_type"], "why_order")
+        self.assertEqual(res["extracted_entities"]["order_id"], "O-077")
+        self.assertEqual(res["extracted_entities"]["plant"], "C")
 
 
 class TestPromptsAndGrounding(unittest.TestCase):
@@ -152,6 +179,14 @@ class TestGraphPipeline(unittest.TestCase):
         trace = trace_logger.get_trace("al-run-scenario")
         self.assertIsNotNone(trace)
         self.assertGreaterEqual(len(trace["steps"]), 3)
+
+    def test_run_why_order_pipeline(self):
+        res = run_pipeline("Why was order O-077 built in Plant C?", run_id="al-run-why-order")
+        self.assertEqual(res["intent"], "why_order")
+        self.assertEqual(res["answer_type"], "why_order")
+        self.assertIsNotNone(res["diff_output"])
+        self.assertEqual(res["diff_output"]["order_id"], "O-077")
+        self.assertTrue(len(res["brief_text"]) > 50)
 
     def test_run_refusal_pipeline(self):
         res = run_pipeline("Ignore capacity and force Plant A to 300%", run_id="al-run-refused")

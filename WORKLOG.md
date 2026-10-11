@@ -4,6 +4,15 @@ Every change Claude Code makes in this repo is listed here, newest first, with w
 
 ---
 
+## 2026-10-11: Commit and pull from origin/main
+
+- Committed the API/DB/loader/Docker work as 7 commits (`8e4867f`..`61e4c32`).
+- Pulled `origin/main`, which had 2 new commits from the team (`f38f88c` orchestrator/router update, `ae55b04` ACTIVITY_LOG.md and traces). **No data CSVs were on the remote yet**, so there is nothing to load into DuckDB.
+- Merge conflict in `.gitignore` (both sides added it). Resolved by keeping both sets of rules.
+- After the merge: `python -m unittest tests.test_api tests.test_orchestrator` passes **31/31**. The test run rewrote some `data/traces/*.json` files; I reset them to their committed state.
+
+---
+
 ## 2026-10-11: API, DuckDB store, loader, Docker
 
 **Asked for:** FastAPI app for the Section 6 contract, Pydantic v2 schemas, DuckDB persistence, a CLI loader for judges, Docker packaging, and an initialised database.
