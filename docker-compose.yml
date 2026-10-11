@@ -12,7 +12,7 @@ services:
     environment:
       DB_PATH: /app/data/allocation.db
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
-      LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
+      LLM_MODEL: ${LLM_MODEL}
       MOCK_LLM: ${MOCK_LLM:-false}
       # Ollama runs on the host machine (Section 8)
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}

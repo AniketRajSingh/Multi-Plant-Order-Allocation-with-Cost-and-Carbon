@@ -65,6 +65,9 @@ def load_config() -> Dict[str, Any]:
     return _CONFIG_CACHE
 
 
+get_config = load_config
+
+
 def get_llm_model() -> str:
     """Retrieve the LLM model name strictly from config or environment."""
     cfg = load_config()
