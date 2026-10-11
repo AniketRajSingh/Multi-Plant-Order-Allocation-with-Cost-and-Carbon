@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 AnswerType = Literal[
     "allocation",
     "scenario",
+    "why_order",
     "brief",
     "infeasible",
     "clarification_needed",

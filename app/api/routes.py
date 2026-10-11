@@ -130,6 +130,9 @@ def _summary(
 ) -> str:
     if answer_type in ("refused", "clarification_needed") or not kpis:
         return (brief or "No result produced.").strip().split("\n\n")[0]
+    if diff and "reasons" in diff:
+        head = f"Order {diff['order_id']} is built in Plant {diff.get('assigned_plant')}." if diff.get("order_id") else ""
+        return " ".join([head, *diff["reasons"]]).strip()
 
     parts = []
     cost, carbon, late = kpis.get("total_cost"), kpis.get("total_carbon_t"), kpis.get("late_orders")

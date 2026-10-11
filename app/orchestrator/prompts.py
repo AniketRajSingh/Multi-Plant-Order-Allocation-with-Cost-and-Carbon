@@ -207,79 +207,89 @@ def generate_grounded_mock_brief(state: AllocationState) -> str:
     solver = state.get("raw_solver_output") or {}
     kpis = solver.get("kpis") or {}
     weights = state.get("weights") or {"cost": 0.7, "carbon": 0.3}
-    diff = state.get("diff_output")
-    scenario = state.get("scenario")
-    val = state.get("validation_result") or {"capacity_ok": True, "eligibility_ok": True}
+    diff = state.get("diff_output") or {}
+    is_scenario = "extra_cost" in diff
+    is_why = "reasons" in diff
+    val = state.get("validation_result") or {}
 
-    cost = kpis.get("total_cost", 0)
-    carbon_t = kpis.get("total_carbon_t", 0)
-    late = kpis.get("late_orders", 0)
-    util = kpis.get("plant_utilisation", {})
-    util_str = ", ".join([f"Plant {p}: {round(v * 100, 1)}%" for p, v in util.items()])
+    cost = kpis.get("total_cost") or 0
+    carbon_t = kpis.get("total_carbon_t") or 0
+    late = kpis.get("late_orders") or 0
+    util = kpis.get("plant_utilisation") or {}
+    util_str = ", ".join(f"Plant {p}: {round(v * 100, 2)}%" for p, v in util.items() if v is not None)
+    unallocated = solver.get("unallocated_orders") or []
 
     lines = []
     lines.append("# Multi-Plant Allocation Executive Brief")
     lines.append(f"**Run ID:** `{state.get('run_id')}` | **Intent:** `{state.get('intent')}`")
     lines.append("")
 
-    # Summary
-    if diff:
-        extra_cost = diff.get("extra_cost", 0)
-        extra_carbon = diff.get("extra_carbon_t", 0)
-        moved = diff.get("orders_moved", 0)
-        lines.append("## 1. Executive Summary")
-        lines.append(
-            f"Following the disturbance ({scenario.get('description', 'Capacity loss event') if scenario else 'disturbance'}), "
-            f"the allocation has been re-planned. Extra cost incurred: ${extra_cost:,.2f}, "
-            f"extra carbon emissions: {extra_carbon} t, with {moved} orders relocated to alternative plants."
-        )
+    lines.append("## 1. Executive Summary")
+    if is_scenario:
+        lines.append(f"Re-planned after the capacity change. {diff.get('summary', '')}")
+    elif is_why:
+        lines.append(f"Order {diff.get('order_id')} is built in Plant {diff.get('assigned_plant')}. " + " ".join(diff.get("reasons", [])))
     else:
-        lines.append("## 1. Executive Summary")
         lines.append(
-            f"Optimal multi-plant allocation completed under {int(weights.get('cost', 0.7)*100)}% cost / "
-            f"{int(weights.get('carbon', 0.3)*100)}% carbon weighting. "
-            f"Total landed cost is ${cost:,.2f} with total carbon footprint of {carbon_t} t and {late} late orders."
+            f"Allocation solved at {round(weights.get('cost', 0.7) * 100, 2)}% cost / "
+            f"{round(weights.get('carbon', 0.3) * 100, 2)}% carbon weighting. "
+            f"Total landed cost is {cost:,.2f} with total carbon of {carbon_t} t and {late} late orders."
         )
+    if unallocated:
+        lines.append(f"{len(unallocated)} orders cannot be met with the available capacity: "
+                     + ", ".join(u["order_id"] for u in unallocated) + ".")
 
     lines.append("")
     lines.append("## 2. Operational KPIs & Plant Utilisation")
-    lines.append(f"- **Total Landed Cost:** ${cost:,.2f}")
+    lines.append(f"- **Total Landed Cost:** {cost:,.2f}")
     lines.append(f"- **Total Carbon:** {carbon_t} t")
-    lines.append(f"- **Late Orders:** {late}")
+    lines.append(f"- **Late Orders:** {late}" + (f" ({', '.join(kpis.get('late_order_ids') or [])})" if late else ""))
     if util_str:
         lines.append(f"- **Plant Utilisation:** {util_str}")
     lines.append(f"- **Validation Status:** Capacity OK = `{val.get('capacity_ok')}`, Eligibility OK = `{val.get('eligibility_ok')}`")
 
-    if diff:
+    if is_scenario:
         lines.append("")
         lines.append("## 3. Scenario Variance Analysis")
-        lines.append(f"- **Incremental Cost:** +${diff.get('extra_cost', 0):,.2f}")
-        lines.append(f"- **Incremental Carbon:** +{diff.get('extra_carbon_t', 0)} t")
+        lines.append(f"- **Incremental Cost:** {diff.get('extra_cost', 0):+,.2f}")
+        lines.append(f"- **Incremental Carbon:** {diff.get('extra_carbon_t', 0):+} t")
         lines.append(f"- **Orders Reallocated:** {diff.get('orders_moved', 0)}")
-        lines.append(f"- **Late Orders Delta:** {diff.get('late_delta', 0)}")
+        lines.append(f"- **Late Orders Delta:** {diff.get('late_delta', 0):+d}")
+        for m in (diff.get("moved_order_details") or [])[:10]:
+            lines.append(f"  - {m['order_id']}: Plant {m['from_plant']} -> Plant {m['to_plant']} "
+                         f"(cost {m['cost_delta']:+,.2f}, carbon {m['carbon_delta_kg']:+} kg)")
+    elif is_why:
+        lines.append("")
+        lines.append("## 3. Plant Options for This Order")
+        for o in diff.get("options") or []:
+            if not o.get("eligible"):
+                lines.append(f"- Plant {o['plant']}: cannot make this product")
+                continue
+            lines.append(f"- Plant {o['plant']}: cost {o['cost']:,.2f}, carbon {o['carbon_kg']} kg, "
+                         f"arrives {o['arrival']} ({'on time' if o['on_time'] else str(o['days_late']) + ' day(s) late'})")
 
     lines.append("")
     lines.append("## 4. Structured Recommendations")
-    if diff:
-        lines.append("### Recommendation 1: Approve Emergency Plant Reallocation")
-        lines.append(f"- **Action:** Relocate {diff.get('orders_moved', 0)} orders from affected plant to available alternative plants.")
-        lines.append(f"- **Rationale:** Preserves delivery schedule within physical plant capacities following disturbance.")
-        lines.append(f"- **Evidence Refs:** `['diff.extra_cost', 'diff.extra_carbon_t', 'diff.orders_moved']`")
+    if is_scenario:
+        lines.append("### Recommendation 1: Approve the re-planned allocation")
+        lines.append(f"- **Action:** Move {diff.get('orders_moved', 0)} orders as listed above.")
+        lines.append("- **Rationale:** Keeps every plant within its reduced capacity at the lowest weighted cost and carbon.")
+        lines.append("- **Evidence Refs:** `['diff.extra_cost', 'diff.extra_carbon_t', 'diff.orders_moved']`")
         lines.append("- **Confidence:** HIGH")
-        lines.append(f"- **Estimated Impact:** +${diff.get('extra_cost', 0):,.2f} cost, +{diff.get('extra_carbon_t', 0)} t carbon")
+        lines.append(f"- **Estimated Impact:** {diff.get('extra_cost', 0):+,.2f} cost, {diff.get('extra_carbon_t', 0):+} t carbon")
         lines.append("- **Requires Approval:** True")
     else:
-        lines.append("### Recommendation 1: Execute Base Allocation Plan")
-        lines.append(f"- **Action:** Release purchase and transport schedules according to solver allocation.")
-        lines.append(f"- **Rationale:** Plan strictly passes all capacity and product eligibility checks at minimal landed cost.")
-        lines.append(f"- **Evidence Refs:** `['solver.kpis.total_cost', 'validator.capacity_ok', 'validator.eligibility_ok']`")
+        lines.append("### Recommendation 1: Execute the solver allocation")
+        lines.append("- **Action:** Release production and transport schedules according to the solver allocation.")
+        lines.append("- **Rationale:** The plan passes the independent capacity and eligibility checks.")
+        lines.append("- **Evidence Refs:** `['solver.kpis.total_cost', 'validator.capacity_ok', 'validator.eligibility_ok']`")
         lines.append("- **Confidence:** HIGH")
-        lines.append(f"- **Estimated Impact:** Landed cost of ${cost:,.2f} and {carbon_t} t carbon")
-        lines.append("- **Requires Approval:** False")
+        lines.append(f"- **Estimated Impact:** Landed cost of {cost:,.2f} and {carbon_t} t carbon")
+        lines.append("- **Requires Approval:** " + ("True" if unallocated or late else "False"))
 
     lines.append("")
     lines.append("## 5. Assumptions & Limitations")
-    lines.append("- **Assumptions:** Weight configuration applied is strictly as requested; duties and tariffs held constant.")
-    lines.append("- **Limitations:** Plant capacities reflect weekly limits; carbon factors based on regional grid averages.")
+    lines.append("- **Assumptions:** Weights applied as requested; landed cost = (unit cost + transport) x (1 + duty).")
+    lines.append("- **Limitations:** Energy price is not in the data, so energy cost is excluded; one-week planning horizon.")
 
     return "\n".join(lines)
