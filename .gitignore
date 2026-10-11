@@ -19,7 +19,9 @@ htmlcov/
 *.swo
 .DS_Store
 
-# DuckDB store is rebuilt by scripts/load_data.py
+# DuckDB and SQLite stores are rebuilt by scripts/load_data.py and dump_to_sqlite.py
 data/*.duckdb
 data/*.duckdb.wal
+data/*.sqlite*
+data/*.db*
 .vscode
