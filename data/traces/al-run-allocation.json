@@ -25,7 +25,7 @@
         "total_carbon_t": 1.67,
         "late_orders": 0,
         "unallocated_orders": 0,
-        "solve_time_ms": 25.6
+        "solve_time_ms": 25.1
       }
     },
     {
@@ -45,7 +45,7 @@
   ],
   "llm_calls": 1,
   "tokens": 1450,
-  "_created_at": 1791712280.9510632,
+  "_created_at": 1791712886.1605692,
   "_token_breakdown": {
     "prompt_tokens": 950,
     "completion_tokens": 500

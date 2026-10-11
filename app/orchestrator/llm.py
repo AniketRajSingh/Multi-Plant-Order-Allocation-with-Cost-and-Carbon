@@ -17,44 +17,7 @@ from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger("orchestrator_llm")
 
-# Default Ollama configuration
-DEFAULT_OLLAMA_BASE_URL = "http://192.168.3.173:11434"
-DEFAULT_OLLAMA_MODEL = "jev-9b:latest" #QWEN3.8:9B
-
-
-def load_env_file() -> None:
-    """Load configuration from local uncommitted .env file if present."""
-    env_path = Path.cwd() / ".env"
-    if not env_path.exists():
-        return
-
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip("'\"")
-                if k not in os.environ:
-                    os.environ[k] = v
-    except Exception as e:
-        logger.warning(f"Could not parse .env file: {e}")
-
-
-# Load local env on import
-load_env_file()
-
-
-def get_ollama_base_url() -> str:
-    """Retrieve configured Ollama base URL."""
-    return os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL).rstrip("/")
-
-
-def get_ollama_model() -> str:
-    """Retrieve configured Ollama model name."""
-    return os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+from app.config import get_llm_model as get_ollama_model, get_ollama_base_url
 
 
 def get_configured_llm(temperature: float = 0.0, timeout: float = 60.0) -> ChatOpenAI:

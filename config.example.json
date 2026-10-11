@@ -1,0 +1,9 @@
+{
+  "llm_provider": "ollama",
+  "llm_model": "your-model-name",
+  "ollama_base_url": "http://localhost:11434",
+  "mock_llm": false,
+  "planning_start": "2026-10-12",
+  "db_path": "data/allocation.db",
+  "api_port": 8000
+}

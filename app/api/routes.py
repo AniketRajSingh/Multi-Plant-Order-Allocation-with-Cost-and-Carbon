@@ -42,12 +42,6 @@ router = APIRouter()
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
-DEFAULT_MODELS = {
-    "ollama": "llama3.1:8b",
-    "openai": "gpt-6-luna",
-    "anthropic": "claude-haiku-4-5-20251001",
-    "gemini": "gemini-3.8-flash",
-}
 PROVIDER_KEYS = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
@@ -351,9 +345,10 @@ def _solver_health() -> SolverHealth:
 
 
 def _llm_health() -> LLMHealth:
-    provider = os.getenv("LLM_PROVIDER", "ollama").lower()
-    model = os.getenv("LLM_MODEL") or DEFAULT_MODELS.get(provider, "unknown")
-    mock = os.getenv("MOCK_LLM", "false").lower() == "true"
+    from app.config import get_llm_model, get_llm_provider, get_mock_llm, get_ollama_base_url
+    provider = get_llm_provider()
+    model = get_llm_model() or "unspecified"
+    mock = get_mock_llm()
 
     if mock:
         return LLMHealth(status="ok", provider=provider, model=model, mock=True,
@@ -363,7 +358,6 @@ def _llm_health() -> LLMHealth:
         return LLMHealth(status="ok" if has_key else "degraded", provider=provider, model=model, mock=False,
                          detail=None if has_key else f"{PROVIDER_KEYS[provider]} not set")
     if provider == "ollama":
-        from app.orchestrator.llm import get_ollama_base_url
         base = get_ollama_base_url()
         try:
             with urllib.request.urlopen(f"{base}/api/tags", timeout=1.5) as resp:
