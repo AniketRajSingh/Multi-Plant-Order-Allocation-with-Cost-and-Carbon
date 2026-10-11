@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary & Objective
 
-Implemented the core orchestration, intent routing, prompt engineering with zero-hallucination guardrails, and Annex C compliant execution trace auditing system.
+Implemented the core orchestration, intent routing, prompt engineering with zero-hallucination guardrails, Member 1 PuLP solver and validator tool bindings, local Ollama integration, and Annex C compliant execution trace auditing system.
 
 ### Core Architecture Rule
 > **"A solver builds the allocation. The LLM explains it and runs what-if scenarios by calling tools. It NEVER invents numbers."**
@@ -32,7 +32,7 @@ Implemented the core orchestration, intent routing, prompt engineering with zero
   - `brief_text`: Grounded executive brief markdown.
   - `trace_steps`: Execution trace sequence matching Annex C schema.
   - `token_usage`: Cumulative prompt/completion tokens and LLM call counts.
-  - `answer_type`: Contract response category per Section 6.2.
+  - `answer_type`: Contract response category per Section 6.2 (including `"why_order"`).
 
 ### 2.2 Intent Classifier — `app/orchestrator/router.py`
 - Implemented hybrid intent classification with entity extraction:
@@ -47,22 +47,39 @@ Implemented the core orchestration, intent routing, prompt engineering with zero
 
 ### 2.3 Zero-Hallucination Prompts & Verifier — `app/orchestrator/prompts.py`
 - `SYSTEM_PROMPT_EXECUTIVE_BRIEF`: Strict briefing instructions restricting output to tool-derived figures.
-- Structured Recommendation Contract: Each recommendation strictly includes `action`, `rationale`, `evidence_refs`, `confidence`, `estimated_impact`, and `requires_approval`.
-- `verify_brief_grounding()`: Regex-based numerical auditor that extracts all numbers from generated text and verifies existence in tool outputs. Flags and rejects any uncomputed numbers.
-- `generate_grounded_mock_brief()`: High-speed deterministic generator for `MOCK_LLM=true` mode and fallback.
+- Instruction: *"Write a 1-page executive brief using ONLY the verified metrics in the context. Do NOT calculate or hallucinate any numbers. Format with Action, Rationale, and KPI Impact."*
+- Raw Read-Only Facts Block: Formats raw JSON metrics as strictly read-only ground truth.
+- Structured Operational Decisions: Every recommendation is explicitly formatted with:
+  - **Action**: Concrete operational directive.
+  - **Rationale**: Grounded operational justification citing verified metrics.
+  - **KPI Impact**: Exact quantitative cost, carbon, and delivery impact verbatim from verified metrics.
+- `verify_brief_grounding()`: Programmatic numerical auditor that extracts all numbers from generated text and verifies existence in tool outputs. Flags and rejects any uncomputed numbers.
+- `generate_grounded_mock_brief()`: Deterministic generator for `MOCK_LLM=true` mode and fallback protection.
 
-### 2.4 LangGraph State Machine — `app/orchestrator/graph.py`
+### 2.4 Operational Tool Bindings — `app/tools/tools.py`
+Bound Member 1's optimisation subsystem into LangGraph (`ALLOCATION_TOOLS`):
+1. **`solve_allocation`**: Bridges Member 1's PuLP MILP solver (`app.solver.milp.solve_allocation`), translating scenario disturbances into plant capacity overrides (`retained_fraction`).
+2. **`validate_plan`**: Bridges Member 1's independent Annex A validator (`app.solver.validator.validate_plan`) verifying weekly capacity, product eligibility, and arrival dates.
+3. **`compare_plans`**: Solves baseline vs. disturbed plan to compute `extra_cost`, `extra_carbon_t`, `orders_moved`, and shifted order details.
+4. **`explain_order`**: Evaluates single-order cost/carbon/transit across all 3 plants using Member 1's candidate metrics (`app.solver.cost_carbon.calculate_candidate_metrics`), proving the Annex A worked example for Order O-077 (Plant C on-time vs Plant A late).
+
+### 2.5 Local Ollama LLM Integration — `app/orchestrator/llm.py`
+- Integrates local Ollama endpoint (`http://192.168.3.173:11434`) using model `jev-9b:latest`.
+- Implemented `clean_llm_response()`: Strips reasoning chain tokens (`<think>...</think>`) so the generated brief is clean executive markdown.
+- Tracks prompt and completion tokens into Annex C trace logger.
+- Configuration is loaded via uncommitted `.env` file (protected by `.gitignore`).
+
+### 2.6 LangGraph State Machine — `app/orchestrator/graph.py`
 - Multi-agent directed graph with nodes:
   - `router` $\rightarrow$ Classifies intent and populates parameters.
   - `optimiser` $\rightarrow$ Calls `solve_allocation` tool.
   - `checker` $\rightarrow$ Calls `validate_plan` tool (Annex A rules).
   - `scenario` $\rightarrow$ Calls `compare_plans` tool (diff analysis).
-  - `diagnosis` $\rightarrow$ Calls `diagnose_order` tool (bottlenecks and transit delays).
-  - `writer` $\rightarrow$ Calls `write_brief` with automated grounding audit.
+  - `diagnosis` $\rightarrow$ Calls `explain_order` tool (evaluates all 3 plants).
+  - `writer` $\rightarrow$ Calls `write_brief` with automated grounding audit and Ollama LLM execution.
   - `clarification` / `refusal` $\rightarrow$ Deterministic policy endpoints.
-- Conditional branching based on classified `intent` and `answer_type`.
 
-### 2.5 Audit Trace Logger — `app/tracer/trace_logger.py`
+### 2.7 Audit Trace Logger — `app/tracer/trace_logger.py`
 - Thread-safe trace logger matching Annex C schema for `GET /trace/{run_id}`:
   ```json
   {
@@ -85,24 +102,24 @@ Implemented the core orchestration, intent routing, prompt engineering with zero
 
 ## 3. Verification & Test Execution
 
-- Test Suite: `tests/test_orchestrator.py`
-- Run Command: `python3 -m unittest discover tests`
-- Result: **16/16 tests passing** (0 errors, 0 failures).
-- Test Coverage:
-  - State TypedDict key validity
-  - Intent classification across all answer types and edge cases
-  - Entity extraction (order ID, plant, percentage loss, objective weights)
-  - Hallucination detector catching uncomputed numbers
-  - End-to-end execution of graph pipelines (scenario, why_order, refusal)
-  - Trace persistence and Annex C schema validation
+- Test Suites:
+  - `unittest discover tests`: **21/21 passed** (state, router, prompts, grounding auditor, tools, pipelines).
+  - `pytest tests/test_solver.py`: **79/79 passed** (Member 1 solver, validator, trade-off curves).
+  - Total: **100/100 tests passing**.
+- Tested Scenarios:
+  - Base allocation optimization
+  - Capacity disturbance re-plan (Plant B -30%)
+  - Single-order diagnosis (`explain_order` for O-077)
+  - Policy refusal on invalid / out-of-bound constraint requests
+  - Zero-hallucination numerical verification detecting fabricated figures
+  - Local Ollama `jev-9b:latest` live connectivity and reasoning cleanup
 
 ---
 
 ## 4. Repository & Version Control
 
-- Created `.gitignore` excluding Python bytecode, virtual environments, and temporary files.
-- Purged cached `.pyc` files from Git tracking.
-- Git Commit History:
+- Created `.gitignore` excluding Python bytecode, virtual environments, and uncommitted config/env files (`.env*`, `config.json`).
+- Commit History:
   - `3dc2453`: Init commit
   - `f38f88c`: Update orchestrator and router components
   - Next commit: Add activity log and synchronize trace data
@@ -428,3 +445,14 @@ total_carbon_kg = qty × unit_carbon_kg
 - ✅ Implementation plan executed and verified
 - ✅ All 8 deliverables created, compiled, and verified
 - ✅ Activity log synchronized
+
+---
+
+## 6. GenAI & Orchestration Lead Contributions
+- **LangGraph State Machine (`app/orchestrator/graph.py`):** Bound Member 1 PuLP solver, Annex A validator, scenario plan comparator, and order diagnosis tools into a deterministic workflow.
+- **Executive Brief Prompts (`app/orchestrator/prompts.py`):** Enforced zero-hallucination constraint with verified metrics, requiring Action, Rationale, and KPI Impact format.
+- **Local Ollama Integration (`app/orchestrator/llm.py`):** Integrated local Ollama endpoint with reasoning token (`<think>`) stripping and automatic fallback to verified mock generator.
+- **Git Commit Lineage:**
+  - `1f9e8aa` / `4ace464`: `feat(orchestrator): bind Member 1 tools to LangGraph and format executive brief prompts with Action, Rationale, and KPI Impact`
+  - `a029e4a` / `ec00e49`: `feat(llm): configure local Ollama client integration and reasoning token cleanup`
+  - `27b4c6a`: `docs: update activity log with tool bindings, prompts, and Ollama integration`
