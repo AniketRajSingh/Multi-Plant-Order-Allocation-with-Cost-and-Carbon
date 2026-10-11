@@ -1,0 +1,52 @@
+{
+  "run_id": "al-run-why-order",
+  "request": "Why was order O-077 built in Plant C?",
+  "steps": [
+    {
+      "agent": "diagnostician",
+      "tool": "diagnose_order",
+      "input": {
+        "request": "Why was order O-077 built in Plant C?"
+      },
+      "output": {
+        "order_id": "O-077",
+        "root_cause": "Cheapest Plant A misses customer due date by 3 days due to 7-day transit time.",
+        "cheapest_option": {
+          "plant": "A",
+          "cost": 17400.0,
+          "transit_days": 7,
+          "on_time": false
+        },
+        "recommended_option": {
+          "plant": "C",
+          "cost": 18200.0,
+          "transit_days": 3,
+          "on_time": true
+        },
+        "tradeoff_delta": {
+          "added_cost": 800.0,
+          "status": "ON_TIME_GUARANTEED"
+        }
+      }
+    },
+    {
+      "agent": "checker",
+      "tool": "validate_plan",
+      "output": {
+        "capacity_ok": true,
+        "eligibility_ok": true
+      }
+    },
+    {
+      "agent": "writer",
+      "tool": "write_brief"
+    }
+  ],
+  "llm_calls": 1,
+  "tokens": 1200,
+  "_created_at": 1791704178.991832,
+  "_token_breakdown": {
+    "prompt_tokens": 800,
+    "completion_tokens": 400
+  }
+}

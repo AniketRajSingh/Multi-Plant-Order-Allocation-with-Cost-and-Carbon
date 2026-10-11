@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Literal, Optional, TypedDict
 AnswerType = Literal[
     "allocation",
     "scenario",
+    "why_order",
     "brief",
     "infeasible",
     "clarification_needed",
@@ -22,8 +23,10 @@ AnswerType = Literal[
 IntentType = Literal[
     "allocation",
     "scenario",
+    "why_order",
     "diagnosis",
     "brief",
+    "infeasible",
     "clarification_needed",
     "refused",
 ]
