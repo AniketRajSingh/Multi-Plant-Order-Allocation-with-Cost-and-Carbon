@@ -177,7 +177,8 @@ class KPIs(BaseModel):
     total_cost: Optional[float] = None
     total_carbon_t: Optional[float] = None
     late_orders: Optional[int] = None
-    plant_utilisation: Dict[str, float] = Field(default_factory=dict)
+    # null when a plant's effective capacity is 0 (e.g. a 100% capacity loss)
+    plant_utilisation: Dict[str, Optional[float]] = Field(default_factory=dict)
 
 
 class TradeoffPoint(BaseModel):
@@ -283,10 +284,16 @@ class LLMHealth(ComponentHealth):
     mock: bool
 
 
+class SolverHealth(ComponentHealth):
+    name: str
+    version: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded", "down"]
     api: ComponentHealth
     data_store: DataStoreHealth
+    solver: SolverHealth
     llm: LLMHealth
 
 
