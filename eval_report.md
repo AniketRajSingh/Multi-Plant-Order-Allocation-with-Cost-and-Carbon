@@ -24,7 +24,7 @@ All tests are run against the live FastAPI backend via HTTP requests using the `
 |---|---|
 | Backend | FastAPI + Uvicorn |
 | Solver | PuLP/CBC (MILP) |
-| Database | DuckDB (in-memory for tests) |
+| Database | SQLite (in-memory for tests) |
 | LLM Mode | `MOCK_LLM=true` (deterministic) |
 | Python | 3.12 |
 | API URL | `http://localhost:8000` |

@@ -19,7 +19,7 @@ logger = logging.getLogger("orchestrator_llm")
 
 # Default Ollama configuration
 DEFAULT_OLLAMA_BASE_URL = "http://192.168.3.173:11434"
-DEFAULT_OLLAMA_MODEL = "jev-9b:latest"
+DEFAULT_OLLAMA_MODEL = "jev-9b:latest" #QWEN3.8:9B
 
 
 def load_env_file() -> None:

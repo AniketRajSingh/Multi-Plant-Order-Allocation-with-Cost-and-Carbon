@@ -1,6 +1,6 @@
 """Deterministic tools called by the LangGraph nodes.
 
-Every number these tools return is computed from the tables in DuckDB
+Every number these tools return is computed from the tables in SQLite
 (app.db.database) by the optimisation package (app.solver). Nothing here is
 hard-coded or produced by an LLM.
 

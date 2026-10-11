@@ -37,7 +37,7 @@ flowchart TB
         Diff["Variance Engine (ΔCost, ΔCarbon, Re-routed Orders)"]
     end
 
-    subgraph Storage["💾 Persistence Layer (DuckDB)"]
+    subgraph Storage["💾 Persistence Layer (SQLite)"]
         DB[("orders • plants • transport_duties • capacity_events • audit_traces")]
     end
 
@@ -174,7 +174,7 @@ In accordance with Hackathon rules:
 |---|---|---|
 | **Member 1 (Sunandini)** | **Optimization & Math Lead** | PuLP MILP formulation (`milp.py`), candidate landed cost/carbon engine (`cost_carbon.py`), Pareto frontier generator (`tradeoff.py`), and Annex A Rule Validator (`validator.py`). |
 | **Member 2 (Aniket Raj Singh)** | **GenAI & Orchestration Lead** | LangGraph multi-agent graph (`graph.py`), intent classifier (`router.py`), grounded prompt templates (`prompts.py`), local Ollama integration (`llm.py`), and Annex C trace auditing (`trace_logger.py`). |
-| **Member 3 (Shagun)** | **Backend & Data Lead** | FastAPI service implementation (`routes.py`), Pydantic v2 schemas (`schemas.py`), DuckDB database architecture (`database.py`), CLI loader script (`load_data.py`), and Docker containerization. |
+| **Member 3 (Shagun)** | **Backend & Data Lead** | FastAPI service implementation (`routes.py`), Pydantic v2 schemas (`schemas.py`), SQLite database architecture (`database.py`), CLI loader script (`load_data.py`), and Docker containerization. |
 | **Member 4 (QA / UI Lead)** | **Frontend & QA Lead** | Streamlit interactive dashboard (`app.py`), 24-case automated evaluation benchmark suite (`run_eval.py`), Section 4.5 dataset validator (`validate_data.py`), and evaluation report (`eval_report.md`). |
 
 ---
@@ -183,7 +183,7 @@ In accordance with Hackathon rules:
 
 We hereby declare that:
 1. All code, solver formulations, data ingestion pipelines, and agent workflows presented in this repository represent the original work of the team members listed above.
-2. Open-source libraries (PuLP, FastAPI, DuckDB, LangGraph, Streamlit, Pandas) have been used in accordance with their respective open-source licenses.
+2. Open-source libraries (PuLP, FastAPI, SQLite, LangGraph, Streamlit, Pandas) have been used in accordance with their respective open-source licenses.
 3. No proprietary, confidential, or real company data has been used. All datasets are 100% synthetically generated.
 4. No solutions or answers have been hardcoded for test cases; all recommendations are produced dynamically by the mathematical solver.
 

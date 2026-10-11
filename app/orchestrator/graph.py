@@ -90,7 +90,7 @@ def _plan_or_error(weights, scenario, use_loaded_events: bool) -> Dict[str, Any]
 # ============================================================================
 
 def optimiser_node(state: AllocationState) -> Dict[str, Any]:
-    """Optimiser agent calling solve_allocation on the DuckDB data."""
+    """Optimiser agent calling solve_allocation on the SQLite data."""
     start_time = time.time()
     weights = state.get("weights") or {"cost": 0.7, "carbon": 0.3}
     scenario = state.get("scenario")

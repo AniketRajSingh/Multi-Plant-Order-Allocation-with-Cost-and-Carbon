@@ -1,4 +1,4 @@
-"""Tests for the DuckDB layer, the CLI loader and the Section 6 API contract."""
+"""Tests for the SQLite layer, the CLI loader and the Section 6 API contract."""
 
 import json
 import os
@@ -118,7 +118,7 @@ class TestLoaderCLI(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
             write_pack(folder)
-            db_path = str(folder / "t.duckdb")
+            db_path = str(folder / "t.db")
             code = load_data.main(["--dir", str(folder), "--db", db_path, "--planning-start", "2026-10-12", "--json"])
             self.assertEqual(code, 0)
             self.assertEqual(Database(db_path).table_counts()["plants"], 4)

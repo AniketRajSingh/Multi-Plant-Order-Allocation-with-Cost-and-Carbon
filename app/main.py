@@ -18,8 +18,8 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    db = get_db()  # creates the DuckDB file and schema on first start
-    logging.getLogger("api").info("DuckDB ready at %s, tables: %s", db.path, db.table_counts())
+    db = get_db()  # creates the SQLite file and schema on first start
+    logging.getLogger("api").info("SQLite ready at %s, tables: %s", db.path, db.table_counts())
     yield
 
 

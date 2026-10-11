@@ -2,7 +2,7 @@
 
 **Project:** Multi-Plant Order Allocation with Cost and Carbon  
 **Hackathon:** HCLTech Future Ready AI Engineer Hackathon  
-**Target Solution:** Neuro-Symbolic Multi-Agent Allocation Engine (PuLP + LangGraph + DuckDB/SQLite + Streamlit)
+**Target Solution:** Neuro-Symbolic Multi-Agent Allocation Engine (PuLP + LangGraph + SQLite + Streamlit)
 
 ---
 
@@ -19,7 +19,7 @@ To satisfy this mandate, data must be validated **before any analysis**, physica
 
 The problem statement specifies 6 required validation checks to be run and presented during the demonstration. Our platform implements them in two layers:
 1. **Pre-Ingestion CSV Validator CLI:** [`scripts/validate_data.py`](file:///Users/aniketrajsingh/Desktop/HCLTech/scripts/validate_data.py) (zero dependencies, pure pandas).
-2. **Relational Database Validator:** [`scripts/load_data.py`](file:///Users/aniketrajsingh/Desktop/HCLTech/scripts/load_data.py) and [`app/db/database.py`](file:///Users/aniketrajsingh/Desktop/HCLTech/app/db/database.py) (DuckDB & SQLite relational integrity).
+2. **Relational Database Validator:** [`scripts/load_data.py`](file:///Users/aniketrajsingh/Desktop/HCLTech/scripts/load_data.py) and [`app/db/database.py`](file:///Users/aniketrajsingh/Desktop/HCLTech/app/db/database.py) (SQLite relational integrity).
 
 ### Validation Check Matrix
 
@@ -43,7 +43,7 @@ python3 scripts/load_data.py --dir data/sample \
 ```
 
 ```text
-Database: data/allocation.duckdb
+Database: data/allocation.db
 
 Load results
 ------------------------------------------------------------------------
@@ -139,24 +139,15 @@ Analysis of the Section 4.4 traps in the competition dataset reveals five critic
 
 ---
 
-## 7. Database Architecture: DuckDB & SQLite Dual Maintenance
+## 7. Database Architecture: SQLite Standard Persistence Layer
 
-### Why Both Are Supported
-- **DuckDB (`data/allocation.duckdb`):** Fast in-process OLAP, vector execution, direct `.df()` conversion for pandas analytical workflows.
-- **SQLite (`data/allocation.sqlite`):** Zero-dependency standard SQL engine included in Python's standard library; universally supported across all inspection environments and external database visualizers.
+### Why SQLite Is Used
+- **Standard Library Zero-Dependency:** Standard Python `sqlite3` requires zero external compiled binary dependencies.
+- **WAL Mode (Write-Ahead Logging):** Enables high concurrency between FastAPI worker threads and CLI scripts with thread-safe locking.
+- **Universal Tooling:** Inspectable via standard SQLite CLI, DB Browser, DBeaver, and ORM tools.
 
-### Standalone Migration & Sync Tool ([`scripts/dump_to_sqlite.py`](file:///Users/aniketrajsingh/Desktop/HCLTech/scripts/dump_to_sqlite.py))
-To migrate data from DuckDB to SQLite while maintaining 100% data integrity:
-
-```bash
-# Export all tables from DuckDB to SQLite
-python3 scripts/dump_to_sqlite.py --duckdb data/allocation.duckdb --sqlite data/allocation.sqlite
-
-# Verify table counts in SQLite
-python3 scripts/dump_to_sqlite.py --verify-only --sqlite data/allocation.sqlite
-```
-
-**Verified Database Parity:**
+### Database Verification
+All 8 Annex B and system audit tables are stored in `data/allocation.db`:
 - `orders`: 8 rows
 - `plants`: 6 rows
 - `transport_duties`: 9 rows
@@ -166,4 +157,4 @@ python3 scripts/dump_to_sqlite.py --verify-only --sqlite data/allocation.sqlite
 - `runs`: 7 rows
 - `traces`: 7 rows
 
-Both databases maintain identical schemas and row counts.
+Database integrity is verified via `python3 scripts/load_data.py --check-only --planning-start 2026-10-12`.

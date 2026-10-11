@@ -1,10 +1,8 @@
-"""DuckDB persistence for the Annex B tables, ingest audit, run results and traces.
+"""SQLite persistence for the Annex B tables, ingest audit, run results and traces.
 
 Design notes:
-- One DuckDB file (DUCKDB_PATH, default data/allocation.duckdb).
-- Connections are short-lived (opened per operation). DuckDB allows only one
-  writer process per file, so holding a connection open in the API would block
-  the CLI loader (scripts/load_data.py) while the API is running.
+- Uses Python's built-in `sqlite3` standard library (zero external dependencies).
+- Connection pool with WAL mode (Write-Ahead Logging) and thread-safe locking.
 - Every CSV row is validated against its Annex B Pydantic row model. Invalid
   rows are rejected with a reason and recorded in `rejected_rows`; they never
   reach the data tables.
@@ -16,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
@@ -24,52 +23,49 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
-import duckdb
 import pandas as pd
 from pydantic import ValidationError
 
 from app.api.schemas import ROW_MODELS
 
 
-DEFAULT_DB_PATH = "data/allocation.duckdb"
+DEFAULT_DB_PATH = "data/allocation.db"
 
 # Base DDL for the Annex B tables. Extra columns are appended at ingest time.
 TABLE_DDL: Dict[str, str] = {
     "orders": """
-        order_id    VARCHAR NOT NULL,
-        product     VARCHAR NOT NULL,
+        order_id    TEXT NOT NULL,
+        product     TEXT NOT NULL,
         qty         INTEGER NOT NULL,
-        destination VARCHAR NOT NULL,
-        due         DATE    NOT NULL
+        destination TEXT NOT NULL,
+        due         TEXT NOT NULL
     """,
     "plants": """
-        plant               VARCHAR NOT NULL,
-        product             VARCHAR NOT NULL,
+        plant               TEXT NOT NULL,
+        product             TEXT NOT NULL,
         weekly_capacity     INTEGER NOT NULL,
-        unit_cost           DOUBLE  NOT NULL,
-        energy_kwh_per_unit DOUBLE  NOT NULL,
-        carbon_kg_per_kwh   DOUBLE  NOT NULL
+        unit_cost           REAL NOT NULL,
+        energy_kwh_per_unit REAL NOT NULL,
+        carbon_kg_per_kwh   REAL NOT NULL
     """,
     "transport_duties": """
-        plant                   VARCHAR NOT NULL,
-        destination             VARCHAR NOT NULL,
-        transport_cost_per_unit DOUBLE  NOT NULL,
+        plant                   TEXT NOT NULL,
+        destination             TEXT NOT NULL,
+        transport_cost_per_unit REAL NOT NULL,
         transit_days            INTEGER NOT NULL,
-        duty_pct                DOUBLE  NOT NULL,
-        carbon_kg_per_unit      DOUBLE  NOT NULL
+        duty_pct                REAL NOT NULL,
+        carbon_kg_per_unit      REAL NOT NULL
     """,
     "capacity_events": """
-        event_id          VARCHAR NOT NULL,
-        plant             VARCHAR NOT NULL,
-        from_date         DATE    NOT NULL,
-        to_date           DATE    NOT NULL,
-        capacity_loss_pct DOUBLE  NOT NULL
+        event_id          TEXT NOT NULL,
+        plant             TEXT NOT NULL,
+        from_date         TEXT NOT NULL,
+        to_date           TEXT NOT NULL,
+        capacity_loss_pct REAL NOT NULL
     """,
 }
 
 # Natural key per table, used for de-duplication, append and upsert.
-# Optional key columns join the key only when the file has them
-# (e.g. a `week` column when carbon intensity varies by week).
 TABLE_KEYS: Dict[str, List[str]] = {
     "orders": ["order_id"],
     "plants": ["plant", "product"],
@@ -103,35 +99,35 @@ COLUMN_ALIASES: Dict[str, str] = {
 
 SYSTEM_DDL = """
 CREATE TABLE IF NOT EXISTS ingest_log (
-    ingest_id     VARCHAR PRIMARY KEY,
-    table_name    VARCHAR NOT NULL,
-    source        VARCHAR,
-    mode          VARCHAR NOT NULL,
+    ingest_id     TEXT PRIMARY KEY,
+    table_name    TEXT NOT NULL,
+    source        TEXT,
+    mode          TEXT NOT NULL,
     rows_loaded   INTEGER NOT NULL,
     rows_rejected INTEGER NOT NULL,
-    status        VARCHAR NOT NULL,
-    loaded_at     TIMESTAMP NOT NULL
+    status        TEXT NOT NULL,
+    loaded_at     TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rejected_rows (
-    ingest_id  VARCHAR NOT NULL,
-    table_name VARCHAR NOT NULL,
+    ingest_id  TEXT NOT NULL,
+    table_name TEXT NOT NULL,
     row_number INTEGER NOT NULL,
-    reason     VARCHAR NOT NULL,
-    raw        JSON
+    reason     TEXT NOT NULL,
+    raw        TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
-    run_id      VARCHAR PRIMARY KEY,
-    request     VARCHAR,
-    answer_type VARCHAR,
-    response    JSON,
-    latency_ms  DOUBLE,
-    created_at  TIMESTAMP NOT NULL
+    run_id      TEXT PRIMARY KEY,
+    request     TEXT,
+    answer_type TEXT,
+    response    TEXT,
+    latency_ms  REAL,
+    created_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS traces (
-    run_id     VARCHAR PRIMARY KEY,
-    request    VARCHAR,
-    trace      JSON NOT NULL,
-    created_at TIMESTAMP NOT NULL
+    run_id     TEXT PRIMARY KEY,
+    request    TEXT,
+    trace      TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -179,24 +175,33 @@ class CheckResult:
 
 
 class Database:
-    """Thin DuckDB wrapper. Safe to share across FastAPI worker threads."""
+    """SQLite wrapper. Thread-safe and safe to share across FastAPI workers."""
 
     def __init__(self, path: Optional[str] = None):
-        self.path = path or os.getenv("DUCKDB_PATH", DEFAULT_DB_PATH)
+        env_path = os.getenv("DB_PATH") or os.getenv("SQLITE_PATH")
+        self.path = path or env_path or DEFAULT_DB_PATH
         self._lock = threading.RLock()
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        # An in-memory database would vanish between short-lived connections,
-        # so keep one connection open for that case (used by tests).
-        self._memory_con = duckdb.connect(":memory:") if self.path == ":memory:" else None
+        # Keep an open memory connection for :memory: testing
+        self._memory_con = sqlite3.connect(":memory:", check_same_thread=False) if self.path == ":memory:" else None
+        if self._memory_con:
+            self._configure_connection(self._memory_con)
+
+    @staticmethod
+    def _configure_connection(con: sqlite3.Connection) -> None:
+        con.execute("PRAGMA foreign_keys = ON;")
+        con.execute("PRAGMA journal_mode = WAL;")
+        con.execute("PRAGMA synchronous = NORMAL;")
 
     @contextmanager
-    def connect(self, read_only: bool = False) -> Iterator[duckdb.DuckDBPyConnection]:
+    def connect(self, read_only: bool = False) -> Iterator[sqlite3.Connection]:
         with self._lock:
             if self._memory_con is not None:
                 yield self._memory_con
                 return
-            con = duckdb.connect(self.path, read_only=read_only)
+            con = sqlite3.connect(self.path, timeout=60.0, check_same_thread=False)
+            self._configure_connection(con)
             try:
                 yield con
             finally:
@@ -209,7 +214,8 @@ class Database:
         with self.connect() as con:
             for table, ddl in TABLE_DDL.items():
                 con.execute(f"CREATE TABLE IF NOT EXISTS {table} ({ddl})")
-            con.execute(SYSTEM_DDL)
+            con.executescript(SYSTEM_DDL)
+            con.commit()
 
     def table_counts(self) -> Dict[str, int]:
         with self.connect() as con:
@@ -228,7 +234,7 @@ class Database:
         mode: str = "replace",
         source_name: Optional[str] = None,
     ) -> IngestResult:
-        """Validate and load one Annex B CSV (a path or raw bytes) into `table`."""
+        """Validate and load one Annex B CSV into `table`."""
         result = IngestResult(table=table, mode=mode)
         if table not in TABLE_DDL:
             result.errors.append(f"unknown table '{table}'; expected one of {sorted(TABLE_DDL)}")
@@ -240,7 +246,7 @@ class Database:
         try:
             buffer = io.BytesIO(source) if isinstance(source, bytes) else source
             raw = pd.read_csv(buffer, dtype=str, keep_default_na=False, skipinitialspace=True)
-        except Exception as exc:  # malformed CSV, wrong encoding, empty file
+        except Exception as exc:
             result.errors.append(f"could not parse CSV: {exc}")
             return result
 
@@ -269,24 +275,25 @@ class Database:
                 df[col] = _infer_extra_column(df[col])
 
         with self.connect() as con:
-            con.execute("BEGIN TRANSACTION")
             try:
                 if mode == "append" and not df.empty:
                     df, existing_rejects = self._drop_existing_keys(con, table, df, valid_rows, key_cols)
                     rejected.extend(existing_rejects)
-                # A file with no valid rows never touches the table, so a bad
-                # upload in replace mode cannot wipe the data already loaded.
+
                 if not df.empty:
                     if mode == "replace":
                         con.execute(f"DROP TABLE IF EXISTS {table}")
                         con.execute(f"CREATE TABLE {table} ({TABLE_DDL[table]})")
+
                     self._add_missing_columns(con, table, df)
-                    con.register("incoming", df)
+
                     if mode == "upsert":
-                        join = " AND ".join(f"{table}.{k} = incoming.{k}" for k in key_cols)
-                        con.execute(f"DELETE FROM {table} USING incoming WHERE {join}")
-                    con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM incoming")
-                    con.unregister("incoming")
+                        for _, r in df.iterrows():
+                            where_clause = " AND ".join(f"{k} = ?" for k in key_cols)
+                            params = [r[k] for k in key_cols]
+                            con.execute(f"DELETE FROM {table} WHERE {where_clause}", params)
+
+                    df.to_sql(table, con, if_exists="append", index=False)
 
                 result.rows_loaded = len(df)
                 result.rows_rejected = len(rejected)
@@ -295,24 +302,25 @@ class Database:
                 ]
                 result.total_rows_in_table = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 self._log_ingest(con, result, source_name or _source_label(source), rejected)
-                con.execute("COMMIT")
+                con.commit()
             except Exception as exc:
-                con.execute("ROLLBACK")
+                con.rollback()
                 result.rows_loaded = 0
                 result.errors.append(f"database write failed: {exc}")
         return result
 
     @staticmethod
-    def _add_missing_columns(con: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> None:
-        existing = {r[0] for r in con.execute(f"DESCRIBE {table}").fetchall()}
+    def _add_missing_columns(con: sqlite3.Connection, table: str, df: pd.DataFrame) -> None:
+        info = con.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {r[1] for r in info}
         for col in df.columns:
             if col not in existing:
-                sql_type = "DOUBLE" if pd.api.types.is_numeric_dtype(df[col]) else "VARCHAR"
+                sql_type = "REAL" if pd.api.types.is_numeric_dtype(df[col]) else "TEXT"
                 con.execute(f'ALTER TABLE {table} ADD COLUMN "{col}" {sql_type}')
 
     @staticmethod
     def _drop_existing_keys(
-        con: duckdb.DuckDBPyConnection,
+        con: sqlite3.Connection,
         table: str,
         df: pd.DataFrame,
         valid_rows: List[Tuple[int, Dict[str, Any]]],
@@ -331,17 +339,16 @@ class Database:
 
     def _log_ingest(
         self,
-        con: duckdb.DuckDBPyConnection,
+        con: sqlite3.Connection,
         result: IngestResult,
         source: str,
         rejected: List[Tuple[int, str, Dict[str, Any]]],
     ) -> None:
-        # Random suffix: on Windows the clock can return the same microsecond for back-to-back ingests.
         ingest_id = f"ing-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4().hex[:6]}"
         con.execute(
             "INSERT INTO ingest_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [ingest_id, result.table, source, result.mode, result.rows_loaded,
-             result.rows_rejected, result.status, _now()],
+             result.rows_rejected, result.status, _now().isoformat()],
         )
         if rejected:
             con.executemany(
@@ -352,11 +359,19 @@ class Database:
     # ------------------------------------------------------------------ reads
 
     def get_table(self, table: str) -> pd.DataFrame:
-        """Return a whole Annex B table as a DataFrame (what the solver consumes)."""
+        """Return a whole Annex B table as a DataFrame."""
         if table not in TABLE_DDL:
             raise ValueError(f"unknown table '{table}'")
         with self.connect() as con:
-            return con.execute(f"SELECT * FROM {table}").df()
+            df = pd.read_sql_query(f"SELECT * FROM {table}", con)
+            # Ensure date columns are formatted as expected by pandas analyzers
+            if "due" in df.columns:
+                df["due"] = pd.to_datetime(df["due"]).dt.date
+            if "from_date" in df.columns:
+                df["from_date"] = pd.to_datetime(df["from_date"]).dt.date
+            if "to_date" in df.columns:
+                df["to_date"] = pd.to_datetime(df["to_date"]).dt.date
+            return df
 
     def load_dataset(self) -> Dict[str, pd.DataFrame]:
         return {t: self.get_table(t) for t in TABLE_DDL}
@@ -367,8 +382,9 @@ class Database:
         with self.connect() as con:
             con.execute(
                 "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?)",
-                [run_id, request, answer_type, json.dumps(response, default=str), latency_ms, _now()],
+                [run_id, request, answer_type, json.dumps(response, default=str), latency_ms, _now().isoformat()],
             )
+            con.commit()
 
     def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         with self.connect() as con:
@@ -379,8 +395,9 @@ class Database:
         with self.connect() as con:
             con.execute(
                 "INSERT OR REPLACE INTO traces VALUES (?, ?, ?, ?)",
-                [trace["run_id"], trace.get("request", ""), json.dumps(trace, default=str), _now()],
+                [trace["run_id"], trace.get("request", ""), json.dumps(trace, default=str), _now().isoformat()],
             )
+            con.commit()
 
     def get_trace(self, run_id: str) -> Optional[Dict[str, Any]]:
         with self.connect() as con:
@@ -394,11 +411,11 @@ class Database:
         planning_start: Optional[date] = None,
         expected_counts: Optional[Dict[str, int]] = None,
     ) -> List[CheckResult]:
-        """Cross-table checks from Section 4.5. Row-level checks already ran at ingest."""
+        """Cross-table checks from Section 4.5."""
         planning_start = planning_start or _planning_start_from_env()
         checks: List[CheckResult] = []
         with self.connect() as con:
-            q = lambda sql: con.execute(sql).fetchall()  # noqa: E731
+            q = lambda sql, params=(): con.execute(sql, params).fetchall()  # noqa: E731
 
             counts = {t: q(f"SELECT COUNT(*) FROM {t}")[0][0] for t in TABLE_DDL}
             for t in ("orders", "plants", "transport_duties"):
@@ -444,14 +461,13 @@ class Database:
                 f"{bad_cap} non-positive capacity rows" if bad_cap else "all capacities > 0 units/week",
             ))
 
-            early = q(f"SELECT order_id, due FROM orders WHERE due <= DATE '{planning_start.isoformat()}' ORDER BY due")
+            early = q("SELECT order_id, due FROM orders WHERE due <= ? ORDER BY due", [planning_start.isoformat()])
             checks.append(CheckResult(
                 f"due dates are after the planning start ({planning_start.isoformat()})",
                 not early,
                 f"{len(early)} orders due on/before start: {[r[0] for r in early[:20]]}" if early else "all due dates later",
             ))
 
-            # kg CO2e/kWh: real grids sit roughly 0.0-1.2. Values far above suggest g/kWh was supplied.
             ci_min, ci_max = q("SELECT MIN(carbon_kg_per_kwh), MAX(carbon_kg_per_kwh) FROM plants")[0]
             ci_ok = ci_max is None or ci_max <= 2.0
             checks.append(CheckResult(
@@ -524,7 +540,6 @@ def _drop_duplicate_keys(
 
 
 def _infer_extra_column(col: pd.Series) -> pd.Series:
-    """Extra columns arrive as strings; make them numeric when every value parses."""
     numeric = pd.to_numeric(col, errors="coerce")
     if numeric.notna().sum() == col.notna().sum():
         return numeric
@@ -549,14 +564,14 @@ _db_lock = threading.Lock()
 
 
 def set_db(db: Optional[Database]) -> None:
-    """Swap the process-wide Database (tests, or pointing the API at another file)."""
+    """Swap the process-wide Database."""
     global _db
     with _db_lock:
         _db = db
 
 
 def get_db() -> Database:
-    """Process-wide Database (also the FastAPI dependency)."""
+    """Process-wide Database."""
     global _db
     with _db_lock:
         if _db is None:

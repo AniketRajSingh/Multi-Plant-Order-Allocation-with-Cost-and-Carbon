@@ -7,7 +7,7 @@ This script performs pre-ingestion checks on 4 CSV files:
   - transport_duties.csv
   - capacity_events.csv (optional)
 
-It uses pure Python + pandas (no backend / DuckDB imports) so that data quality
+It uses pure Python + pandas (no backend / database imports) so that data quality
 can be verified before running ingestion or database loads.
 """
 

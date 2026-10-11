@@ -10,7 +10,7 @@ services:
       - path: .env
         required: false
     environment:
-      DUCKDB_PATH: /app/data/allocation.duckdb
+      DB_PATH: /app/data/allocation.db
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
       LLM_MODEL: ${LLM_MODEL:-llama3.1:8b}
       MOCK_LLM: ${MOCK_LLM:-false}
@@ -19,7 +19,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # DuckDB file, traces and CSVs persist on the host. Load judge data with:
+      # SQLite DB, traces and CSVs persist on the host. Load judge data with:
       #   docker compose exec api python scripts/load_data.py --dir data/raw
       - ./data:/app/data
     restart: unless-stopped

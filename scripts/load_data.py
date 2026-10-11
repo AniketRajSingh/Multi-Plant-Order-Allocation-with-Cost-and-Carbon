@@ -1,4 +1,4 @@
-"""Load Annex B CSV files into the DuckDB store, then run the Section 4.5 validation checks.
+"""Load Annex B CSV files into the SQLite store, then run the Section 4.5 validation checks.
 
 Examples
 --------
@@ -46,7 +46,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         p.add_argument(f"--{table.replace('_', '-')}", dest=table, type=Path, help=f"path to {table}.csv")
     p.add_argument("--mode", choices=["replace", "append", "upsert"], default="replace",
                    help="replace the table (default), append new keys only, or upsert by key")
-    p.add_argument("--db", help="DuckDB file (default: $DUCKDB_PATH or data/allocation.duckdb)")
+    p.add_argument("--db", help="SQLite database file (default: $DB_PATH or data/allocation.db)")
     p.add_argument("--api-url", help="POST files to <api-url>/ingest instead of writing the DB directly")
     p.add_argument("--planning-start", type=date.fromisoformat,
                    help="planning start date for the due-date check (default: $PLANNING_START or today)")
@@ -113,7 +113,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     db.init_schema()
 
     if args.init_only:
-        print(f"Initialised DuckDB schema at {db.path}")
+        print(f"Initialised SQLite schema at {db.path}")
         print("Tables:", json.dumps(db.table_counts()))
         return 0
 
@@ -141,7 +141,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             report["loads"].append(res)
             failed |= res.get("status") == "failed"
 
-    # With --api-url the API owns the file, but DuckDB connections are short-lived,
+    # With --api-url the API owns the file, but SQLite WAL mode supports concurrent reads,
     # so reading it here for the checks still works when run on the same host.
     checks = db.run_validation_checks(planning_start=args.planning_start, expected_counts=expected)
     report["checks"] = [c.to_dict() for c in checks]

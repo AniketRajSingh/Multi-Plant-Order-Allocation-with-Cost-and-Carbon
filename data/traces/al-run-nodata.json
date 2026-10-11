@@ -1,0 +1,42 @@
+{
+  "run_id": "al-run-nodata",
+  "request": "Allocate this week's orders.",
+  "steps": [
+    {
+      "agent": "optimiser",
+      "tool": "solve_allocation",
+      "input": {
+        "weights": {
+          "cost": 0.7,
+          "carbon": 0.3
+        },
+        "capacity_overrides": null,
+        "planning_date": null,
+        "data_rows": null
+      },
+      "output": {
+        "status": "DATA_ERROR",
+        "total_cost": null,
+        "total_carbon_t": null,
+        "late_orders": null,
+        "unallocated_orders": 0,
+        "solve_time_ms": null,
+        "error": "No data loaded for ['orders', 'plants', 'transport_duties']. Load the CSVs with scripts/load_data.py or POST /ingest first."
+      }
+    },
+    {
+      "agent": "optimiser",
+      "tool": "explain_no_plan",
+      "output": {
+        "status": "DATA_ERROR"
+      }
+    }
+  ],
+  "llm_calls": 0,
+  "tokens": 0,
+  "_created_at": 1791712281.86691,
+  "_token_breakdown": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0
+  }
+}

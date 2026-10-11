@@ -1,4 +1,4 @@
-"""DuckDB persistence layer."""
+"""SQLite persistence layer."""
 
 from app.db.database import Database, get_db
 
