@@ -1,0 +1,3 @@
+event_id,plant,from_date,to_date,capacity_loss_pct
+E1,B,2026-10-19,2026-11-01,30.0
+E2,C,2026-10-12,2026-11-01,50.0

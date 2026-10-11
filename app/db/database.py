@@ -17,6 +17,7 @@ import io
 import json
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -335,7 +336,8 @@ class Database:
         source: str,
         rejected: List[Tuple[int, str, Dict[str, Any]]],
     ) -> None:
-        ingest_id = f"ing-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        # Random suffix: on Windows the clock can return the same microsecond for back-to-back ingests.
+        ingest_id = f"ing-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4().hex[:6]}"
         con.execute(
             "INSERT INTO ingest_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [ingest_id, result.table, source, result.mode, result.rows_loaded,

@@ -179,12 +179,13 @@ def test_missing_transport_combination():
         calculate_candidate_metrics(orders, plants, tariffs, PLANNING_DATE)
 
 
-def test_inconsistent_plant_capacity_rejected():
-    orders = make_orders([["O-1", "P1", 5, "DE", "2026-10-30"]])
+def test_capacity_may_differ_by_product_within_a_plant():
+    orders = make_orders([["O-1", "P1", 5, "DE", "2026-10-30"], ["O-2", "P2", 5, "DE", "2026-10-30"]])
     plants = make_plants([["A", "P1", 100, 1.0, 1.0, 1.0], ["A", "P2", 200, 1.0, 1.0, 1.0]])
     tariffs = make_tariffs([["A", "DE", 1.0, 1, 0.0, 0.0]])
-    with pytest.raises(DataValidationError, match="inconsistent weekly_capacity"):
-        calculate_candidate_metrics(orders, plants, tariffs, PLANNING_DATE)
+    df = calculate_candidate_metrics(orders, plants, tariffs, PLANNING_DATE).set_index("order_id")
+    assert df.loc["O-1", "weekly_capacity"] == 100
+    assert df.loc["O-2", "weekly_capacity"] == 200
 
 
 def test_invalid_planning_date():
@@ -286,12 +287,32 @@ def test_exactly_one_assignment_per_order():
     assert len(ids) == len(set(ids))
 
 
-def test_plant_wide_capacity_not_duplicated_across_product_rows():
+def test_capacity_is_limited_per_plant_product():
     result = solve_allocation(*_two_plant_capacity_data(), PLANNING_DATE, weights={"cost": 1.0, "carbon": 0.0})
     counts = pd.Series(allocation_map(result)).value_counts().to_dict()
-    assert counts == {"A": 3, "B": 2}  # cheap A filled to 300, not 600
-    assert result["plant_utilisation"]["A"] == pytest.approx(1.0)
+    assert counts == {"A": 3, "B": 2}  # cheap A/P1 filled to its 300 limit; A/P2's 300 cannot take P1 orders
+    diag = result["diagnostics"]
+    assert diag["utilisation_by_product"]["A"]["P1"] == pytest.approx(1.0)
+    assert diag["utilisation_by_product"]["A"]["P2"] == pytest.approx(0.0)
+    assert result["plant_utilisation"]["A"] == pytest.approx(300 / 600)  # plant total = sum of product limits
     assert result["plant_utilisation"]["B"] == pytest.approx(200 / 500)
+
+
+def test_different_product_limits_in_one_plant_are_each_enforced():
+    # Plant A: P1 limit 200, P2 limit 100. Plant B is expensive but roomy.
+    orders = make_orders([[f"O-{i}", "P1", 100, "DE", "2026-10-30"] for i in range(3)]
+                         + [[f"O-{i}", "P2", 100, "DE", "2026-10-30"] for i in range(3, 5)])
+    plants = make_plants([
+        ["A", "P1", 200, 10.0, 1.0, 1.0], ["A", "P2", 100, 10.0, 1.0, 1.0],
+        ["B", "P1", 1000, 20.0, 1.0, 1.0], ["B", "P2", 1000, 20.0, 1.0, 1.0],
+    ])
+    tariffs = make_tariffs([["A", "DE", 1.0, 2, 0.0, 0.0], ["B", "DE", 1.0, 2, 0.0, 0.0]])
+    result = solve_allocation(orders, plants, tariffs, PLANNING_DATE, weights={"cost": 1.0, "carbon": 0.0})
+    loads = result["diagnostics"]["load_by_product"]
+    assert loads["A"] == {"P1": 200.0, "P2": 100.0}
+    assert loads["B"] == {"P1": 100.0, "P2": 100.0}
+    report = validate_plan(result, orders, plants, tariffs, PLANNING_DATE)
+    assert report["capacity_ok"] and report["is_valid"]
 
 
 def test_capacity_override_30pct_loss_replans():
@@ -300,7 +321,8 @@ def test_capacity_override_30pct_loss_replans():
         weights={"cost": 1.0, "carbon": 0.0}, capacity_overrides={"A": 0.70},
     )
     assert result["status"] == STATUS_OPTIMAL
-    assert result["diagnostics"]["effective_capacity"]["A"] == pytest.approx(210.0)
+    assert result["diagnostics"]["effective_capacity_by_product"]["A"]["P1"] == pytest.approx(210.0)
+    assert result["diagnostics"]["effective_capacity_by_product"]["A"]["P2"] == pytest.approx(210.0)
     counts = pd.Series(allocation_map(result)).value_counts().to_dict()
     assert counts == {"A": 2, "B": 3}
 
@@ -399,7 +421,7 @@ def test_validator_accepts_full_solver_result_and_overrides():
     result = solve_allocation(*data, PLANNING_DATE, capacity_overrides={"A": 0.70})
     report = validate_plan(result, *data, PLANNING_DATE, capacity_overrides={"A": 0.70})
     assert report["is_valid"]
-    assert report["effective_capacity"]["A"] == pytest.approx(210.0)
+    assert report["effective_capacity_by_product"]["A"]["P1"] == pytest.approx(210.0)
 
 
 def test_validator_detects_capacity_violation_independently_of_solver():
@@ -408,7 +430,7 @@ def test_validator_detects_capacity_violation_independently_of_solver():
     report = validate_plan(plan, *data, PLANNING_DATE)
     assert not report["capacity_ok"] and not report["is_valid"]
     excess = [v for v in report["violations"] if v["type"] == "capacity_exceeded"][0]
-    assert excess["plant"] == "A" and excess["excess"] == pytest.approx(200.0)
+    assert excess["plant"] == "A" and excess["product"] == "P1" and excess["excess"] == pytest.approx(200.0)
 
 
 def test_validator_uses_capacity_overrides():

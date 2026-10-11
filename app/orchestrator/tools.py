@@ -27,7 +27,10 @@ from app.db.database import Database, get_db
 from app.solver.cost_carbon import (
     DataValidationError,
     calculate_candidate_metrics,
+    capacity_limits,
     effective_capacities,
+    effective_capacity_limits,
+    nest_by_plant,
     plant_capacities,
     prepare_plants,
     to_json_compatible,
@@ -208,7 +211,9 @@ def solve_partial_allocation(
     """
     try:
         cand = calculate_candidate_metrics(orders, plants, tariffs, start)
-        caps = effective_capacities(plant_capacities(prepare_plants(plants)), overrides or None)
+        plants_clean = prepare_plants(plants)
+        caps = effective_capacities(plant_capacities(plants_clean), overrides or None)  # plant totals, reporting
+        limits = effective_capacity_limits(capacity_limits(plants_clean), overrides or None)
     except DataValidationError:
         return None
 
@@ -240,8 +245,11 @@ def solve_partial_allocation(
     )
     for order_id, idx in cand.groupby("order_id", sort=False).indices.items():
         prob += pulp.lpSum(x[k] for k in idx if k in x) <= 1
-    for plant, idx in cand.groupby("plant").indices.items():
-        prob += pulp.lpSum(float(cand.at[k, "qty"]) * x[k] for k in idx if k in x) <= caps[plant]
+    # One limit per plant-product row (same capacity rule as solve_allocation).
+    for key, idx in cand.groupby(["plant", "product"]).indices.items():
+        terms = [float(cand.at[k, "qty"]) * x[k] for k in idx if k in x]
+        if terms:
+            prob += pulp.lpSum(terms) <= limits[key]
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     if pulp.LpStatus[prob.status] != "Optimal":
         return None
@@ -257,11 +265,12 @@ def solve_partial_allocation(
         unallocated.append(to_json_compatible({
             "order_id": o.order_id, "product": o.product, "qty": o.qty, "destination": o.destination,
             "due": o.due, "eligible_plants": opts["plant"].tolist(),
-            "reason": "no remaining capacity at any eligible plant"
+            "reason": "no remaining capacity for this product at any eligible plant"
             + (" that delivers on time" if require_on_time else ""),
         }))
 
     loads = chosen_rows.groupby("plant")["qty"].sum().to_dict()
+    product_loads = chosen_rows.groupby(["plant", "product"])["qty"].sum().to_dict()
     late_rows = chosen_rows.loc[chosen_rows["is_late"].fillna(False).astype(bool)]
     total_carbon = math.fsum(chosen_rows["total_carbon_kg"])
     cols = ["order_id", "plant", "product", "destination", "qty", "due", "unit_landed_cost", "total_cost",
@@ -279,7 +288,12 @@ def solve_partial_allocation(
         "assumptions": cand.attrs.get("assumptions", []) + [
             "Full plan infeasible: closest plan maximises units allocated, then minimises late orders, then cost/carbon"
         ],
-        "diagnostics": {"plant_load_units": loads, "effective_capacity": caps},
+        "diagnostics": {
+            "plant_load_units": loads,
+            "effective_capacity": caps,
+            "load_by_product": nest_by_plant({k: float(product_loads.get(k, 0)) for k in limits}),
+            "effective_capacity_by_product": nest_by_plant(limits),
+        },
     })
     return result, unallocated
 
@@ -314,6 +328,8 @@ def _kpis(result: Mapping[str, Any]) -> Dict[str, Any]:
         "plant_utilisation": {p: _r(u, 4) for p, u in result["plant_utilisation"].items()},
         "plant_load_units": diag.get("plant_load_units", {}),
         "effective_capacity": diag.get("effective_capacity", {}),
+        "load_by_product": diag.get("load_by_product", {}),
+        "effective_capacity_by_product": diag.get("effective_capacity_by_product", {}),
     }
 
 
@@ -482,8 +498,9 @@ def tool_diagnose_order(
     rows = cand.loc[cand["order_id"] == order_id]
     assigned = next((a for a in plan.get("allocations") or [] if a["order_id"] == order_id), None)
     kpis = plan.get("kpis") or {}
-    loads = kpis.get("plant_load_units") or {}
-    caps = kpis.get("effective_capacity") or {}
+    # Capacity is limited per plant-product, so spare capacity is for this order's product.
+    loads = kpis.get("load_by_product") or {}
+    caps = kpis.get("effective_capacity_by_product") or {}
 
     options = []
     for r in rows.itertuples(index=False):
@@ -491,8 +508,10 @@ def tool_diagnose_order(
         if r.eligible:
             days_late = (r.arrival_date - r.due).days
             spare = None
-            if r.plant in caps:
-                spare = caps[r.plant] - loads.get(r.plant, 0) + (r.qty if assigned and assigned["plant"] == r.plant else 0)
+            cap = caps.get(r.plant, {}).get(r.product)
+            if cap is not None:
+                used = loads.get(r.plant, {}).get(r.product, 0)
+                spare = cap - used + (r.qty if assigned and assigned["plant"] == r.plant else 0)
             opt.update({
                 "cost": round(float(r.total_cost), 2), "carbon_kg": round(float(r.total_carbon_kg), 1),
                 "unit_landed_cost": round(float(r.unit_landed_cost), 4), "duty_pct": float(r.duty_pct),

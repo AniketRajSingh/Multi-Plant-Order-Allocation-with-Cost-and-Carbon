@@ -1,0 +1,20 @@
+{
+  "name": "mpoa-synthetic",
+  "version": "1.0",
+  "seed": 42,
+  "planning_start": "2026-10-12",
+  "units": {
+    "weekly_capacity": "units/week",
+    "carbon_kg_per_kwh": "kg CO2e/kWh",
+    "carbon_kg_per_unit": "kg CO2e/unit",
+    "duty_pct": "percent",
+    "capacity_loss_pct": "percent"
+  },
+  "row_counts": {
+    "orders": 150,
+    "plants": 11,
+    "transport_duties": 36,
+    "plant_carbon_weekly": 24,
+    "capacity_events": 2
+  }
+}

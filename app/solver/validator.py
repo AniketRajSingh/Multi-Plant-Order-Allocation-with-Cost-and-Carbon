@@ -7,8 +7,8 @@ capacity rules in :mod:`app.solver.cost_carbon`:
 * every input order is assigned exactly once (no missing, duplicate or
   unknown order IDs; no malformed entries);
 * each assigned plant exists and can manufacture the order's product;
-* plant-wide assigned quantity does not exceed effective capacity
-  (``weekly_capacity * retained_fraction``);
+* assigned quantity per plant-product does not exceed that row's effective
+  capacity (``weekly_capacity[plant, product] * retained_fraction[plant]``);
 * arrival dates and lateness are recomputed from ``planning_date`` and
   ``transit_days``;
 * reported ``qty``, ``total_cost``, ``total_carbon_kg``, ``arrival_date``
@@ -29,7 +29,10 @@ import pandas as pd
 
 from app.solver.cost_carbon import (
     calculate_candidate_metrics,
+    capacity_limits,
     effective_capacities,
+    effective_capacity_limits,
+    nest_by_plant,
     plant_capacities,
     prepare_plants,
     to_json_compatible,
@@ -92,7 +95,9 @@ def validate_plan(
         JSON-compatible dict with ``is_valid``, ``assignment_ok``,
         ``capacity_ok``, ``eligibility_ok``, ``delivery_ok``,
         ``consistency_ok``, ``late_orders_count``, ``late_order_ids``,
-        ``plant_load_units``, ``effective_capacity``, ``plant_utilisation``
+        ``plant_load_units``, ``effective_capacity`` and ``plant_utilisation``
+        (plant totals: load / sum of the plant's product limits),
+        ``load_by_product``, ``effective_capacity_by_product``
         and ``violations`` (each a dict with ``type``, ``message`` and details).
 
     Raises:
@@ -101,8 +106,9 @@ def validate_plan(
     """
     entries = _as_entries(allocation)
     candidates = calculate_candidate_metrics(orders_df, plants_df, tariffs_df, planning_date)
-    capacities = plant_capacities(prepare_plants(plants_df))
-    eff_caps = effective_capacities(capacities, capacity_overrides)
+    plants_clean = prepare_plants(plants_df)
+    eff_limits = effective_capacity_limits(capacity_limits(plants_clean), capacity_overrides)
+    eff_caps = effective_capacities(plant_capacities(plants_clean), capacity_overrides)
 
     by_pair = candidates.set_index(["order_id", "plant"])
     orders = candidates.drop_duplicates("order_id").set_index("order_id")
@@ -167,10 +173,12 @@ def validate_plan(
 
     assigned = pd.DataFrame(accepted)
     loads = {p: 0.0 for p in eff_caps}
+    product_loads = {key: 0.0 for key in eff_limits}
     late_ids: List[str] = []
     if not assigned.empty:
-        for plant, qty in assigned.groupby("plant")["qty"].sum().items():
-            loads[plant] = float(qty)
+        for (plant, product), qty in assigned.groupby(["plant", "product"])["qty"].sum().items():
+            product_loads[(plant, product)] = float(qty)
+            loads[plant] += float(qty)
         for row in assigned.loc[assigned["is_late"].astype(bool)].itertuples(index=False):
             late_ids.append(row.order_id)
             violations.append({
@@ -180,11 +188,12 @@ def validate_plan(
                 "days_late": int((row.arrival_date - row.due).days),
             })
 
-    for plant, load in loads.items():
-        if load > eff_caps[plant] + CAPACITY_TOLERANCE:
+    for (plant, product), load in product_loads.items():
+        cap = eff_limits[(plant, product)]
+        if load > cap + CAPACITY_TOLERANCE:
             add("capacity_exceeded", "capacity",
-                f"Plant {plant} load {load:g} exceeds effective capacity {eff_caps[plant]:g}",
-                plant=plant, load=load, effective_capacity=eff_caps[plant], excess=load - eff_caps[plant])
+                f"Plant {plant} product {product} load {load:g} exceeds effective capacity {cap:g}",
+                plant=plant, product=product, load=load, effective_capacity=cap, excess=load - cap)
 
     utilisation = {
         p: (loads[p] / cap if cap > 0 else (0.0 if loads[p] == 0 else None)) for p, cap in eff_caps.items()
@@ -202,5 +211,7 @@ def validate_plan(
         "plant_load_units": loads,
         "effective_capacity": eff_caps,
         "plant_utilisation": utilisation,
+        "load_by_product": nest_by_plant(product_loads),
+        "effective_capacity_by_product": nest_by_plant(eff_limits),
         "violations": violations,
     })

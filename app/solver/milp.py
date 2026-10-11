@@ -1,52 +1,58 @@
-"""Binary MILP order-to-plant allocation using PuLP and the bundled CBC solver.
+"""Multi-week binary MILP order allocation using PuLP and the bundled CBC solver.
 
 Model
 -----
-Decision variables: ``x[i, p] in {0, 1}`` for every order ``i`` and every
-plant ``p`` listed in ``plants_df`` (one variable per candidate row returned
-by :func:`app.solver.cost_carbon.calculate_candidate_metrics`).
+Weeks ``w = 0 .. H-1`` start on ``planning_date + 7*w``. ``H`` defaults to the
+weeks from the planning date through the latest due date
+(:func:`app.solver.cost_carbon.default_horizon_weeks`).
+
+Decision variables: ``x[i, p, w] in {0, 1}``: order ``i`` is produced at
+plant ``p`` in week ``w``. One variable per eligible (order, plant, week) row
+from :func:`app.solver.cost_carbon.expand_to_weeks`. Each ineligible
+(order, plant) pair also gets one variable that is fixed to 0.
 
 Constraints:
 
-A. Exactly one assignment per order: ``sum_p x[i, p] == 1``.
-B. Plant-wide capacity: ``sum_i qty[i] * x[i, p] <= effective_capacity[p]``
-   (one constraint per plant, never one per plant-product row).
-C. Eligibility: ``x[i, p] == 0`` when plant ``p`` cannot make the product.
-D. Optional hard delivery: with ``require_on_time=True``, ``x[i, p] == 0``
-   for every late candidate.
-E. Capacity overrides: ``effective_capacity = weekly_capacity * retained_fraction``.
+A. Each order is assigned exactly once: ``sum_{p,w} x[i, p, w] == 1``
+   (``<= 1`` in partial mode; see below).
+B. Weekly plant-product capacity:
+   ``sum_{i of product q} qty[i] * x[i, p, w] <= limit[p, q, w]``.
+C. Eligibility: ineligible (order, plant) variables are fixed to 0.
+D. Optional hard delivery: with ``require_on_time=True``, late rows are fixed to 0.
+E. Capacity changes: ``limit[p, q, w] = weekly_capacity[p, q] * override[p] * event_fraction[p, w]``
+   (:func:`app.solver.capacity_events.effective_weekly_limits`). ``capacity_overrides``
+   apply to every week; dated ``capacity_events`` only to the weeks they overlap.
 F. Optional carbon cap: ``total_carbon_kg <= baseline_carbon_kg * (1 - cut/100)``.
 
 Objective (minimised)::
 
     w_cost   * total_cost      / cost_scale
   + w_carbon * total_carbon_kg / carbon_scale
+  + tardiness_weight * total_days_late
   + lateness_penalty * late_orders
 
-Normalisation scales are the sum over orders of the cheapest (respectively
-lowest-carbon) *eligible* candidate, i.e. a lower bound on any plan's total.
-They depend only on the input data (not on overrides, caps or weights), so
-all scenarios and trade-off points share one scale. A non-positive sum (e.g.
-every candidate has zero carbon) falls back to a scale of 1.0, which is
-reported in ``diagnostics``.
+Scales are the sum over orders of the cheapest (respectively lowest-carbon)
+eligible option. They depend only on the data, so every scenario shares them.
+A non-positive sum falls back to 1.0, which is reported in ``diagnostics``.
 
-Lateness penalty: by default the per-late-order penalty is
-``max(DEFAULT_LATENESS_PENALTY, 1 + D)`` where ``D`` is the largest possible
-difference in the weighted normalised cost+carbon terms between any two
-plans. That makes minimising the number of late orders strictly lexicographic
-over cost/carbon: the solver never accepts an extra late order to save money
-or carbon. A caller may override it with ``weights["lateness"]`` (used
-verbatim, no lexicographic guarantee).
+``tardiness_weight`` is scaled so the whole term is at most 1.0. Among late
+orders the solver therefore prefers fewer days late; without it, a late
+order could be pushed to any later week at no cost.
 
-Planning period: one week starting at ``planning_date``. ``capacity_overrides``
-are applied to the whole week; date-ranged capacity events must be converted
-to retained fractions by the caller (``1 - capacity_loss_pct / 100``).
+Lateness penalty: by default ``max(DEFAULT_LATENESS_PENALTY, 2 + D)``, where
+``D`` bounds the largest possible cost/carbon swing between two plans. Adding
+1 for the tardiness term makes minimising the number of late orders strictly
+lexicographic. ``weights["lateness"]`` overrides it verbatim, with no guarantee.
+
+Partial mode (``allow_partial=True``): if not every order fits, the solver
+first maximises the units assigned, then optimises the objective above with
+that many units fixed. The result has status ``PARTIAL`` and lists the
+``unassigned_orders`` (the Section 6.2 "closest option").
 
 Carbon baseline (for ``carbon_cut_pct``): total carbon of the plan this module
 produces with :data:`BASELINE_WEIGHTS`, no carbon cap, and the *same*
-capacity overrides and ``require_on_time`` setting. Callers that solve
-several points (e.g. a trade-off curve) can pass ``baseline_carbon_kg`` so
-every point uses the identical baseline.
+capacity, delivery and horizon settings. Pass ``baseline_carbon_kg`` to share
+one baseline across several solves.
 """
 
 from __future__ import annotations
@@ -59,15 +65,19 @@ import numpy as np
 import pandas as pd
 import pulp
 
+from app.solver.capacity_events import effective_weekly_limits
 from app.solver.cost_carbon import (
-    COST_MODEL_ASSUMPTIONS,
     calculate_candidate_metrics,
-    effective_capacities,
+    capacity_limits,
+    default_horizon_weeks,
+    expand_to_weeks,
     kg_to_tonnes,
+    nest_by_plant,
     parse_planning_date,
     plant_capacities,
     prepare_plants,
     to_json_compatible,
+    validate_horizon_weeks,
 )
 
 # ============================================================================
@@ -84,6 +94,9 @@ BASELINE_WEIGHTS: Dict[str, float] = dict(DEFAULT_WEIGHTS)
 #: carbon terms are each ~1.0 for a near-optimal plan).
 DEFAULT_LATENESS_PENALTY: float = 100.0
 
+#: Upper bound of the whole tardiness (days-late) term, in normalised units.
+TARDINESS_TERM_MAX: float = 1.0
+
 #: Relative slack on the carbon cap to absorb floating-point rounding.
 CARBON_CAP_REL_TOLERANCE: float = 1e-9
 
@@ -94,6 +107,7 @@ SOLVER_NAME = "PuLP/CBC (PULP_CBC_CMD)"
 
 STATUS_OPTIMAL = "OPTIMAL"
 STATUS_FEASIBLE = "FEASIBLE"  # integer-feasible but optimality not proven (e.g. time limit)
+STATUS_PARTIAL = "PARTIAL"  # allow_partial=True and not every order could be assigned
 STATUS_INFEASIBLE = "INFEASIBLE"
 STATUS_UNBOUNDED = "UNBOUNDED"
 STATUS_NOT_SOLVED = "NOT_SOLVED"
@@ -186,16 +200,15 @@ def _validate_baseline(baseline_carbon_kg: Any) -> Optional[float]:
 # OBJECTIVE SCALING
 # ============================================================================
 
-def compute_objective_scales(candidates: pd.DataFrame) -> Dict[str, Any]:
-    """Return positive normalisation scales and the lexicographic lateness bound.
+def compute_objective_scales(weekly: pd.DataFrame) -> Dict[str, Any]:
+    """Return positive normalisation scales and the bounds used for the lateness penalty.
 
     ``cost_scale`` / ``carbon_scale`` are the sum over orders of the minimum
-    eligible total. ``*_range_sum`` is the sum over orders of (max - min)
-    eligible totals, used to bound how much the objective can change between
-    any two plans. Zero or negative sums fall back to 1.0 (flagged).
+    total over that order's eligible (plant, week) rows. ``*_range_sum`` is
+    the sum over orders of (max - min), which bounds how much the objective can
+    change between two plans. Zero or negative sums fall back to 1.0 (flagged).
     """
-    eligible = candidates.loc[candidates["eligible"]]
-    per_order = eligible.groupby("order_id", sort=False).agg(
+    per_order = weekly.groupby("order_id", sort=False).agg(
         cost_min=("total_cost", "min"),
         cost_max=("total_cost", "max"),
         carbon_min=("total_carbon_kg", "min"),
@@ -214,12 +227,19 @@ def compute_objective_scales(candidates: pd.DataFrame) -> Dict[str, Any]:
 
 
 def default_lateness_penalty(scales: Mapping[str, Any], weights: Mapping[str, float]) -> float:
-    """Per-late-order penalty that strictly dominates any cost/carbon trade-off."""
+    """Per-late-order penalty that strictly dominates any cost/carbon/tardiness trade-off."""
     max_swing = (
         weights["cost"] * scales["cost_range_sum"] / scales["cost_scale"]
         + weights["carbon"] * scales["carbon_range_sum"] / scales["carbon_scale"]
     )
-    return max(DEFAULT_LATENESS_PENALTY, 1.0 + max_swing)
+    return max(DEFAULT_LATENESS_PENALTY, 1.0 + max_swing + TARDINESS_TERM_MAX)
+
+
+def _tardiness_weight(weekly: pd.DataFrame) -> float:
+    """Per-day weight so that the whole days-late term is at most TARDINESS_TERM_MAX."""
+    n_orders = weekly["order_id"].nunique()
+    max_days = int(weekly["days_late"].max()) if len(weekly) else 0
+    return TARDINESS_TERM_MAX / (max(n_orders, 1) * (max_days + 1))
 
 
 # ============================================================================
@@ -239,105 +259,134 @@ def _map_status(problem: pulp.LpProblem) -> str:
 
 
 def _solve_model(
-    candidates: pd.DataFrame,
-    eff_caps: Mapping[str, float],
+    weekly: pd.DataFrame,
+    ineligible_pairs: List[Tuple[str, str]],
+    week_limits: Mapping[Tuple[str, str, int], float],
     weights: Mapping[str, float],
     lateness_penalty: float,
     scales: Mapping[str, Any],
     carbon_cap_kg: Optional[float],
     require_on_time: bool,
     time_limit_seconds: Optional[float],
+    allow_partial: bool = False,
 ) -> Dict[str, Any]:
-    """Build and solve the MILP; return status, chosen candidate row indices and model stats."""
-    problem = pulp.LpProblem("order_allocation", pulp.LpMinimize)
-    n = len(candidates)
+    """Build and solve the MILP; return status, chosen weekly row indices and model stats."""
+    n = len(weekly)
     x = [pulp.LpVariable(f"x_{k}", cat=pulp.LpBinary) for k in range(n)]
+    x_inel = [pulp.LpVariable(f"z_{k}", cat=pulp.LpBinary) for k in range(len(ineligible_pairs))]
 
-    eligible = candidates["eligible"].to_numpy(dtype=bool)
-    late = candidates["is_late"].fillna(False).to_numpy(dtype=bool)
-    qty = candidates["qty"].to_numpy(dtype=float)
-    cost = np.where(eligible, candidates["total_cost"].to_numpy(dtype=float), 0.0)
-    carbon = np.where(eligible, candidates["total_carbon_kg"].to_numpy(dtype=float), 0.0)
+    late = weekly["is_late"].to_numpy(dtype=bool)
+    qty = weekly["qty"].to_numpy(dtype=float)
+    cost = weekly["total_cost"].to_numpy(dtype=float)
+    carbon = weekly["total_carbon_kg"].to_numpy(dtype=float)
+    days_late = weekly["days_late"].to_numpy(dtype=float)
+    allowed = ~late if require_on_time else np.ones(n, dtype=bool)
     w_cost = weights["cost"] / scales["cost_scale"]
     w_carbon = weights["carbon"] / scales["carbon_scale"]
+    w_tardy = _tardiness_weight(weekly)
 
-    allowed = eligible.copy()
-    if require_on_time:
-        allowed &= ~late
+    order_rows = weekly.groupby("order_id", sort=False).indices
+    inel_by_order: Dict[str, List[int]] = {}
+    for k, (order_id, _plant) in enumerate(ineligible_pairs):
+        inel_by_order.setdefault(order_id, []).append(k)
 
-    objective_terms = [
-        (x[k], w_cost * cost[k] + w_carbon * carbon[k] + (lateness_penalty if late[k] else 0.0))
-        for k in range(n)
-        if allowed[k]
-    ]
-    problem += pulp.LpAffineExpression(objective_terms), "weighted_objective"
-
-    # A. exactly one plant per order (over all candidate plants)
-    for pos, rows in enumerate(candidates.groupby("order_id", sort=False).indices.values()):
-        problem += pulp.lpSum(x[k] for k in rows) == 1, f"assign_{pos}"
-    # C/D. ineligible (and, if required, late) candidates fixed to zero
-    for k in np.flatnonzero(~allowed):
-        reason = "ineligible" if not eligible[k] else "late"
-        problem += x[k] == 0, f"{reason}_{k}"
-    # B/E. one plant-wide capacity constraint per plant
-    for plant, rows in candidates.groupby("plant", sort=True).indices.items():
-        problem += (
-            pulp.LpAffineExpression([(x[k], qty[k]) for k in rows if allowed[k]]) <= eff_caps[plant],
-            f"capacity_{plant}",
-        )
-    # F. carbon cap
-    if carbon_cap_kg is not None:
-        cap = carbon_cap_kg * (1.0 + CARBON_CAP_REL_TOLERANCE)
-        problem += (
-            pulp.LpAffineExpression([(x[k], carbon[k]) for k in range(n) if allowed[k]]) <= cap,
-            "carbon_cap",
-        )
+    def base_problem(name: str, sense: int) -> pulp.LpProblem:
+        prob = pulp.LpProblem(name, sense)
+        # A. each order assigned once (at most once in partial mode)
+        for pos, (order_id, rows) in enumerate(order_rows.items()):
+            expr = pulp.lpSum(x[k] for k in rows) + pulp.lpSum(x_inel[j] for j in inel_by_order.get(order_id, []))
+            prob += (expr <= 1 if allow_partial else expr == 1), f"assign_{pos}"
+        # C. ineligible pairs fixed to zero
+        for j, var in enumerate(x_inel):
+            prob += var == 0, f"ineligible_{j}"
+        # D. late rows fixed to zero when on-time is required
+        for k in np.flatnonzero(~allowed):
+            prob += x[k] == 0, f"late_{k}"
+        # B/E. weekly plant-product capacity
+        groups = weekly.groupby(["plant", "product", "production_week"], sort=True).indices.items()
+        for pos, (key, rows) in enumerate(groups):
+            terms = [(x[k], qty[k]) for k in rows if allowed[k]]
+            if terms:
+                prob += pulp.LpAffineExpression(terms) <= week_limits[key], f"capacity_{pos}"
+        # F. carbon cap
+        if carbon_cap_kg is not None:
+            prob += (
+                pulp.LpAffineExpression([(x[k], carbon[k]) for k in range(n) if allowed[k]])
+                <= carbon_cap_kg * (1.0 + CARBON_CAP_REL_TOLERANCE),
+                "carbon_cap",
+            )
+        return prob
 
     solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_seconds)
     start = time.perf_counter()
+    units_assigned_max: Optional[float] = None
+    if allow_partial:
+        phase1 = base_problem("max_units", pulp.LpMaximize)
+        phase1 += pulp.LpAffineExpression([(x[k], qty[k]) for k in range(n) if allowed[k]]), "units"
+        phase1.solve(solver)
+        if _map_status(phase1) not in SUCCESS_STATUSES:
+            solve_ms = (time.perf_counter() - start) * 1000.0
+            return {"status": _map_status(phase1), "chosen": [], "unassigned": [], "extraction_problems": [], "objective_value": None,
+                    "solve_ms": solve_ms, "pulp_status": pulp.LpStatus[phase1.status],
+                    "pulp_solution_status": pulp.LpSolution[phase1.sol_status],
+                    "num_variables": n + len(x_inel), "num_constraints": len(phase1.constraints)}
+        units_assigned_max = float(pulp.value(phase1.objective) or 0.0)
+
+    problem = base_problem("order_allocation", pulp.LpMinimize)
+    problem += pulp.LpAffineExpression([
+        (x[k], w_cost * cost[k] + w_carbon * carbon[k] + w_tardy * days_late[k] + (lateness_penalty if late[k] else 0.0))
+        for k in range(n) if allowed[k]
+    ]), "weighted_objective"
+    if units_assigned_max is not None:
+        # Integer units: keep the phase-1 maximum (0.5 absorbs float noise).
+        problem += (
+            pulp.LpAffineExpression([(x[k], qty[k]) for k in range(n) if allowed[k]]) >= units_assigned_max - 0.5,
+            "keep_max_units",
+        )
     problem.solve(solver)
     solve_ms = (time.perf_counter() - start) * 1000.0
 
     status = _map_status(problem)
     chosen: List[int] = []
     problems: List[str] = []
+    unassigned: List[str] = []
     if status in SUCCESS_STATUSES:
         values = np.array([v.varValue if v.varValue is not None else 0.0 for v in x])
-        for order_id, rows in candidates.groupby("order_id", sort=False).indices.items():
+        for order_id, rows in order_rows.items():
             picked = [k for k in rows if values[k] > SELECTION_THRESHOLD]
-            if len(picked) != 1:
-                problems.append(f"order {order_id} has {len(picked)} selected plants in the solver solution")
-            else:
+            if len(picked) > 1 or (len(picked) == 0 and not allow_partial):
+                problems.append(f"order {order_id} has {len(picked)} selected (plant, week) rows in the solver solution")
+            elif picked:
                 chosen.append(int(picked[0]))
-    objective = pulp.value(problem.objective) if status in SUCCESS_STATUSES else None
+            else:
+                unassigned.append(order_id)
     return {
         "status": status,
         "chosen": chosen,
+        "unassigned": unassigned,
         "extraction_problems": problems,
-        "objective_value": objective,
+        "objective_value": pulp.value(problem.objective) if status in SUCCESS_STATUSES else None,
         "solve_ms": solve_ms,
         "pulp_status": pulp.LpStatus[problem.status],
         "pulp_solution_status": pulp.LpSolution[problem.sol_status],
-        "num_variables": n,
+        "num_variables": n + len(x_inel),
         "num_constraints": len(problem.constraints),
     }
 
 
 def _post_solve_checks(
     chosen_rows: pd.DataFrame,
-    eff_caps: Mapping[str, float],
+    week_limits: Mapping[Tuple[str, str, int], float],
     carbon_cap_kg: Optional[float],
     require_on_time: bool,
 ) -> List[str]:
     """Sanity-check a solver solution against hard rules before reporting success."""
     issues: List[str] = []
-    if not chosen_rows["eligible"].all():
-        issues.append("solution assigns an order to an ineligible plant")
-    loads = chosen_rows.groupby("plant")["qty"].sum()
-    for plant, load in loads.items():
-        if load > eff_caps[plant] + 1e-6:
-            issues.append(f"plant {plant} load {load} exceeds effective capacity {eff_caps[plant]}")
-    if require_on_time and chosen_rows["is_late"].fillna(False).any():
+    loads = chosen_rows.groupby(["plant", "product", "production_week"])["qty"].sum()
+    for key, load in loads.items():
+        if load > week_limits[key] + 1e-6:
+            issues.append(f"plant {key[0]} product {key[1]} week {key[2]} load {load} exceeds capacity {week_limits[key]}")
+    if require_on_time and chosen_rows["is_late"].any():
         issues.append("solution contains late orders although require_on_time=True")
     if carbon_cap_kg is not None:
         total = math.fsum(chosen_rows["total_carbon_kg"])
@@ -347,40 +396,37 @@ def _post_solve_checks(
 
 
 def _infeasibility_hints(
-    candidates: pd.DataFrame,
-    eff_caps: Mapping[str, float],
+    weekly: pd.DataFrame,
+    orders: pd.DataFrame,
+    week_limits: Mapping[Tuple[str, str, int], float],
     require_on_time: bool,
     carbon_cap_kg: Optional[float],
 ) -> List[str]:
     """Necessary-condition checks that explain common causes of infeasibility."""
     hints: List[str] = []
-    allowed = candidates["eligible"].copy()
-    if require_on_time:
-        allowed &= ~candidates["is_late"].fillna(False).astype(bool)
-    orders = candidates.drop_duplicates("order_id")
+    allowed_rows = weekly.loc[~weekly["is_late"]] if require_on_time else weekly
 
     total_demand = int(orders["qty"].sum())
-    total_cap = math.fsum(eff_caps.values())
+    total_cap = math.fsum(week_limits.values())
     if total_demand > total_cap:
-        hints.append(f"Total demand {total_demand} units exceeds total effective capacity {total_cap:g}")
+        hints.append(f"Total demand {total_demand} units exceeds total effective capacity {total_cap:g} over the horizon")
 
-    allowed_rows = candidates.loc[allowed]
     no_option = sorted(set(orders["order_id"]) - set(allowed_rows["order_id"]))
     if no_option:
-        why = "eligible on-time plant" if require_on_time else "eligible plant"
+        why = "eligible plant and week that delivers on time" if require_on_time else "eligible plant"
         hints.append(f"Orders with no {why}: {', '.join(no_option)}")
 
-    allowed_cap = allowed_rows["plant"].map(eff_caps)
-    too_big = allowed_rows.assign(cap=allowed_cap).groupby("order_id").agg(qty=("qty", "first"), cap=("cap", "max"))
-    too_big = too_big.loc[too_big["qty"] > too_big["cap"]]
-    for order_id, row in too_big.iterrows():
-        hints.append(f"Order {order_id} qty {int(row['qty'])} exceeds the largest allowed plant capacity {row['cap']:g}")
+    caps = [week_limits[(p, q, w)] for p, q, w in zip(allowed_rows["plant"], allowed_rows["product"], allowed_rows["production_week"])]
+    too_big = allowed_rows.assign(cap=caps).groupby("order_id").agg(qty=("qty", "first"), cap=("cap", "max"))
+    for order_id, row in too_big.loc[too_big["qty"] > too_big["cap"]].iterrows():
+        hints.append(f"Order {order_id} qty {int(row['qty'])} exceeds the largest weekly plant-product capacity {row['cap']:g} available to it")
 
     for product, group in allowed_rows.groupby("product"):
         demand = int(group.drop_duplicates("order_id")["qty"].sum())
-        cap = math.fsum(eff_caps[p] for p in group["plant"].unique())
+        keys = group[["plant", "production_week"]].drop_duplicates()
+        cap = math.fsum(week_limits[(p, product, w)] for p, w in keys.itertuples(index=False))
         if demand > cap:
-            hints.append(f"Product {product}: demand {demand} exceeds combined capacity {cap:g} of its allowed plants")
+            hints.append(f"Product {product}: demand {demand} exceeds its combined capacity {cap:g} over the horizon")
 
     if carbon_cap_kg is not None and not allowed_rows.empty:
         min_carbon = math.fsum(allowed_rows.groupby("order_id")["total_carbon_kg"].min())
@@ -396,29 +442,72 @@ def _infeasibility_hints(
 # RESULT ASSEMBLY
 # ============================================================================
 
+ALLOCATION_COLUMNS = [
+    "order_id", "plant", "product", "destination", "qty", "due",
+    "production_week", "week_start", "unit_landed_cost", "total_cost",
+    "unit_carbon_kg", "total_carbon_kg", "transit_days", "arrival_date", "is_late", "days_late",
+]
+
+
 def _allocation_records(chosen_rows: pd.DataFrame) -> List[Dict[str, Any]]:
-    cols = [
-        "order_id", "plant", "product", "destination", "qty", "due",
-        "unit_landed_cost", "total_cost", "unit_carbon_kg", "total_carbon_kg",
-        "transit_days", "arrival_date", "is_late",
-    ]
-    return [to_json_compatible(rec) for rec in chosen_rows[cols].to_dict(orient="records")]
+    records = chosen_rows[ALLOCATION_COLUMNS].rename(columns={"week_start": "production_week_start"})
+    return [to_json_compatible(rec) for rec in records.to_dict(orient="records")]
 
 
-def _utilisation(chosen_rows: pd.DataFrame, eff_caps: Mapping[str, float]) -> Tuple[Dict[str, Any], Dict[str, float]]:
-    loads = chosen_rows.groupby("plant")["qty"].sum().to_dict()
-    load_by_plant = {p: float(loads.get(p, 0)) for p in eff_caps}
-    util: Dict[str, Any] = {}
-    for plant, cap in eff_caps.items():
-        load = load_by_plant[plant]
-        util[plant] = load / cap if cap > 0 else (0.0 if load == 0 else None)
-    return util, load_by_plant
+def _ratio(load: float, cap: float) -> Optional[float]:
+    return load / cap if cap > 0 else (0.0 if load == 0 else None)
+
+
+def _utilisation(
+    chosen_rows: pd.DataFrame,
+    week_limits: Mapping[Tuple[str, str, int], float],
+    week_starts: List[pd.Timestamp],
+) -> Dict[str, Any]:
+    """Utilisation over the horizon (plant and plant-product) and per plant per week."""
+    cap_pp: Dict[Tuple[str, str], float] = {}
+    cap_pw: Dict[Tuple[str, int], float] = {}
+    for (plant, product, week), cap in week_limits.items():
+        cap_pp[(plant, product)] = cap_pp.get((plant, product), 0.0) + cap
+        cap_pw[(plant, week)] = cap_pw.get((plant, week), 0.0) + cap
+    cap_p: Dict[str, float] = {}
+    for (plant, _), cap in cap_pp.items():
+        cap_p[plant] = cap_p.get(plant, 0.0) + cap
+
+    load_pp = chosen_rows.groupby(["plant", "product"])["qty"].sum().to_dict()
+    load_pw = chosen_rows.groupby(["plant", "production_week"])["qty"].sum().to_dict()
+    load_p = chosen_rows.groupby("plant")["qty"].sum().to_dict()
+    week_label = {w: ts.date().isoformat() for w, ts in enumerate(week_starts)}
+    return {
+        "plant_utilisation": {p: _ratio(float(load_p.get(p, 0)), c) for p, c in cap_p.items()},
+        "plant_load_units": {p: float(load_p.get(p, 0)) for p in cap_p},
+        "effective_capacity": cap_p,
+        "load_by_product": nest_by_plant({k: float(load_pp.get(k, 0)) for k in cap_pp}),
+        "effective_capacity_by_product": nest_by_plant(cap_pp),
+        "utilisation_by_product": nest_by_plant({k: _ratio(float(load_pp.get(k, 0)), c) for k, c in cap_pp.items()}),
+        "utilisation_by_week": nest_by_plant(
+            {(p, week_label[w]): _ratio(float(load_pw.get((p, w), 0)), c) for (p, w), c in cap_pw.items()}
+        ),
+    }
+
+
+def _unassigned_records(orders: pd.DataFrame, weekly: pd.DataFrame, unassigned: List[str], require_on_time: bool) -> List[Dict[str, Any]]:
+    out = []
+    for o in orders.loc[orders["order_id"].isin(unassigned)].itertuples(index=False):
+        plants = sorted(weekly.loc[weekly["order_id"] == o.order_id, "plant"].unique())
+        out.append(to_json_compatible({
+            "order_id": o.order_id, "product": o.product, "qty": o.qty, "destination": o.destination, "due": o.due,
+            "eligible_plants": plants,
+            "reason": "no remaining weekly capacity for this product at any eligible plant within the horizon"
+            + (" that delivers on time" if require_on_time else ""),
+        }))
+    return out
 
 
 def _empty_result(status: str, weights_used: Mapping[str, float], assumptions: List[str], diagnostics: Dict[str, Any]) -> Dict[str, Any]:
     return to_json_compatible({
         "status": status,
         "allocation": [],
+        "unassigned_orders": [],
         "total_cost": None,
         "total_carbon_kg": None,
         "total_carbon_t": None,
@@ -447,34 +536,40 @@ def solve_allocation(
     require_on_time: bool = False,
     time_limit_seconds: Optional[float] = None,
     baseline_carbon_kg: Optional[float] = None,
+    capacity_events: Optional[pd.DataFrame] = None,
+    carbon_weekly: Optional[pd.DataFrame] = None,
+    horizon_weeks: Optional[int] = None,
+    allow_partial: bool = False,
 ) -> Dict[str, Any]:
-    """Allocate every order to exactly one plant by solving a binary MILP.
+    """Allocate every order to a plant and production week by solving a binary MILP.
 
     Args:
         orders_df, plants_df, tariffs_df: Input tables (Annex B schema). Not mutated.
-        planning_date: Start of the one-week planning period.
+        planning_date: Start of week 0 of the planning horizon.
         weights: ``{"cost", "carbon"}`` (normalised to sum to 1) and optional
             ``"lateness"`` penalty per late order. Defaults to :data:`DEFAULT_WEIGHTS`.
-        capacity_overrides: ``{plant: retained_fraction}``; ``{"B": 0.7}`` is a 30% loss.
+        capacity_overrides: ``{plant: retained_fraction}`` for every week; ``{"B": 0.7}`` is a 30% loss.
         carbon_cut_pct: Require ``total_carbon_kg <= baseline * (1 - pct/100)``.
         require_on_time: Forbid late assignments (hard constraint).
         time_limit_seconds: Optional CBC time limit. A solution found but not
             proven optimal is returned with status ``"FEASIBLE"``.
-        baseline_carbon_kg: Extension to the base interface. Pre-computed
-            carbon baseline so several solves share one baseline; when omitted
-            and ``carbon_cut_pct`` is set, the baseline is solved internally
-            (see module docstring).
+        baseline_carbon_kg: Pre-computed carbon baseline so several solves share one.
+        capacity_events: Dated ``capacity_events.csv`` rows; each reduces only the weeks it overlaps.
+        carbon_weekly: Optional ``plant, week_start, carbon_kg_per_kwh`` table (Section 4.4).
+        horizon_weeks: Number of planning weeks; default covers the latest due date.
+        allow_partial: When not every order fits, return the closest plan
+            (status ``PARTIAL``, ``unassigned_orders``) instead of ``INFEASIBLE``.
 
     Returns:
-        JSON-compatible dict with ``status``, ``allocation``, ``total_cost``,
-        ``total_carbon_kg``, ``total_carbon_t``, ``late_orders``,
-        ``late_order_ids``, ``plant_utilisation`` (load / effective capacity),
-        ``weights_used``, ``objective_value``, ``assumptions`` and
-        ``diagnostics``. Non-success statuses (``INFEASIBLE``, ``NOT_SOLVED``,
-        ``ERROR``...) carry an empty allocation and ``None`` totals.
+        JSON-compatible dict with ``status``, ``allocation`` (each entry with
+        ``production_week`` and ``production_week_start``), ``unassigned_orders``,
+        ``total_cost``, ``total_carbon_kg``, ``total_carbon_t``, ``late_orders``,
+        ``late_order_ids``, ``plant_utilisation`` (load / capacity over the horizon),
+        ``weights_used``, ``objective_value``, ``assumptions`` and ``diagnostics``.
+        ``INFEASIBLE``, ``NOT_SOLVED`` and ``ERROR`` carry an empty allocation and ``None`` totals.
 
     Raises:
-        DataValidationError: invalid input tables or capacity overrides.
+        DataValidationError: invalid input tables, events, horizon or capacity overrides.
         ValueError: invalid weights, carbon_cut_pct, time limit or baseline.
     """
     t_start = time.perf_counter()
@@ -482,67 +577,84 @@ def solve_allocation(
     cut = validate_carbon_cut_pct(carbon_cut_pct)
     time_limit = _validate_time_limit(time_limit_seconds)
     baseline = _validate_baseline(baseline_carbon_kg)
-    if not isinstance(require_on_time, (bool, np.bool_)):
-        raise ValueError(f"require_on_time must be a bool, got {require_on_time!r}")
+    for name, flag in (("require_on_time", require_on_time), ("allow_partial", allow_partial)):
+        if not isinstance(flag, (bool, np.bool_)):
+            raise ValueError(f"{name} must be a bool, got {flag!r}")
+    require_on_time, allow_partial = bool(require_on_time), bool(allow_partial)
 
-    candidates = calculate_candidate_metrics(orders_df, plants_df, tariffs_df, planning_date)
-    capacities = plant_capacities(prepare_plants(plants_df))
-    eff_caps = effective_capacities(capacities, capacity_overrides)
-    scales = compute_objective_scales(candidates)
-    if lateness_override is not None:
-        penalty = lateness_override
-    else:
-        penalty = default_lateness_penalty(scales, weights_used)
+    planning = parse_planning_date(planning_date)
+    candidates = calculate_candidate_metrics(orders_df, plants_df, tariffs_df, planning)
+    horizon = validate_horizon_weeks(horizon_weeks) if horizon_weeks is not None else default_horizon_weeks(candidates, planning)
+    weekly = expand_to_weeks(candidates, planning, horizon, carbon_weekly)
+    ineligible_pairs = list(candidates.loc[~candidates["eligible"], ["order_id", "plant"]].itertuples(index=False, name=None))
+    orders = candidates.drop_duplicates("order_id")[["order_id", "product", "qty", "destination", "due"]]
+
+    plants_clean = prepare_plants(plants_df)
+    limits_info = effective_weekly_limits(capacity_limits(plants_clean), planning, horizon, capacity_overrides, capacity_events)
+    week_limits = limits_info["limits"]
+    week_starts = [planning + pd.Timedelta(days=7 * w) for w in range(horizon)]
+
+    scales = compute_objective_scales(weekly)
+    penalty = lateness_override if lateness_override is not None else default_lateness_penalty(scales, weights_used)
     preprocessing_ms = (time.perf_counter() - t_start) * 1000.0
-
     if lateness_override is not None:
         weights_used = {**weights_used, "lateness": lateness_override}
 
-    assumptions = list(COST_MODEL_ASSUMPTIONS) + [
+    assumptions = list(weekly.attrs.get("assumptions", [])) + [
+        f"Planning horizon {horizon} week(s) from {planning.date().isoformat()} to "
+        f"{(week_starts[-1] + pd.Timedelta(days=6)).date().isoformat()}",
         f"Weights {weights_used['cost']:.0%} cost, {weights_used['carbon']:.0%} carbon (normalised to sum to 1)",
         "Cost and carbon are normalised by the sum of each order's cheapest / lowest-carbon eligible option",
         (
             f"Lateness penalty {penalty:g} per late order (custom; no lexicographic guarantee)"
             if lateness_override is not None
-            else f"Lateness penalty {penalty:g} per late order: minimising late orders takes priority over cost and carbon"
+            else f"Lateness penalty {penalty:g} per late order: fewest late orders first, then fewest days late, then cost and carbon"
         ),
-        "Capacity overrides are retained fractions applied to the whole planning week",
+        "capacity_overrides (no dates) apply to every week; dated capacity events apply only to the weeks they overlap",
     ]
+    if limits_info["events"]:
+        assumptions.extend(limits_info["events"]["assumptions"])
     if require_on_time:
         assumptions.append("All orders must arrive on time (hard constraint)")
-    assumptions.extend(candidates.attrs.get("warnings", []))
+    if allow_partial:
+        assumptions.append("If not every order fits, the plan maximises units allocated first and lists unassigned orders")
+    assumptions.extend(weekly.attrs.get("warnings", []))
 
     diagnostics: Dict[str, Any] = {
         "solver": SOLVER_NAME,
-        "planning_date": parse_planning_date(planning_date),
-        "energy_cost_included": False,
-        "original_capacity": capacities,
-        "effective_capacity": eff_caps,
+        "planning_date": planning,
+        "horizon_weeks": horizon,
+        "week_starts": week_starts,
+        "energy_cost_included": bool(candidates.attrs.get("energy_cost_included")),
+        "weekly_carbon_used": carbon_weekly is not None,
+        "original_capacity": plant_capacities(plants_clean),
         "capacity_overrides": dict(capacity_overrides or {}),
-        "require_on_time": bool(require_on_time),
+        "capacity_events": limits_info["events"],
+        "require_on_time": require_on_time,
         "carbon_cut_pct": cut,
         "lateness_penalty_per_order": penalty,
         **{k: scales[k] for k in ("cost_scale", "carbon_scale", "cost_scale_fallback", "carbon_scale_fallback")},
         "preprocessing_ms": preprocessing_ms,
     }
 
+    def run(w: Mapping[str, float], pen: float, cap: Optional[float]) -> Dict[str, Any]:
+        return _solve_model(weekly, ineligible_pairs, week_limits, w, pen, scales, cap, require_on_time, time_limit, allow_partial)
+
     carbon_cap: Optional[float] = None
     baseline_solve_ms = 0.0
     if cut is not None:
         if baseline is None:
-            base_penalty = default_lateness_penalty(scales, BASELINE_WEIGHTS)
-            base_run = _solve_model(candidates, eff_caps, BASELINE_WEIGHTS, base_penalty, scales, None, bool(require_on_time), time_limit)
+            base_run = run(BASELINE_WEIGHTS, default_lateness_penalty(scales, BASELINE_WEIGHTS), None)
             baseline_solve_ms = base_run["solve_ms"]
-            if base_run["status"] not in SUCCESS_STATUSES or base_run["extraction_problems"]:
+            if base_run["status"] not in SUCCESS_STATUSES or base_run["extraction_problems"] or base_run["unassigned"]:
                 diagnostics.update({
-                    "baseline_status": base_run["status"],
+                    "baseline_status": STATUS_PARTIAL if base_run.get("unassigned") else base_run["status"],
                     "baseline_solve_ms": baseline_solve_ms,
-                    "reason": "Carbon baseline plan could not be solved, so the carbon cap is undefined",
-                    "infeasibility_hints": _infeasibility_hints(candidates, eff_caps, bool(require_on_time), None),
+                    "reason": "Carbon baseline plan could not assign every order, so the carbon cap is undefined",
+                    "infeasibility_hints": _infeasibility_hints(weekly, orders, week_limits, require_on_time, None),
                 })
-                status = STATUS_INFEASIBLE if base_run["status"] == STATUS_INFEASIBLE else base_run["status"]
-                return _empty_result(status, weights_used, assumptions, diagnostics)
-            baseline = math.fsum(candidates.loc[base_run["chosen"], "total_carbon_kg"])
+                return _empty_result(STATUS_INFEASIBLE, weights_used, assumptions, diagnostics)
+            baseline = math.fsum(weekly.loc[base_run["chosen"], "total_carbon_kg"])
             diagnostics["baseline_source"] = "solved internally with BASELINE_WEIGHTS"
         else:
             diagnostics["baseline_source"] = "provided by caller"
@@ -550,40 +662,47 @@ def solve_allocation(
         diagnostics.update({"baseline_carbon_kg": baseline, "carbon_cap_kg": carbon_cap, "baseline_solve_ms": baseline_solve_ms})
         assumptions.append(
             f"Carbon cut {cut:g}% vs baseline {baseline:.3f} kg (plan with baseline weights "
-            f"{BASELINE_WEIGHTS['cost']:.0%}/{BASELINE_WEIGHTS['carbon']:.0%}, same capacity and delivery settings, no cap)"
+            f"{BASELINE_WEIGHTS['cost']:.0%}/{BASELINE_WEIGHTS['carbon']:.0%}, same capacity, delivery and horizon settings, no cap)"
         )
 
-    run = _solve_model(candidates, eff_caps, weights_used, penalty, scales, carbon_cap, bool(require_on_time), time_limit)
-    diagnostics.update({k: run[k] for k in ("solve_ms", "pulp_status", "pulp_solution_status", "num_variables", "num_constraints")})
+    result_run = run(weights_used, penalty, carbon_cap)
+    diagnostics.update({k: result_run[k] for k in ("solve_ms", "pulp_status", "pulp_solution_status", "num_variables", "num_constraints")})
     diagnostics["total_ms"] = (time.perf_counter() - t_start) * 1000.0
 
-    if run["status"] not in SUCCESS_STATUSES:
-        if run["status"] == STATUS_INFEASIBLE:
-            diagnostics["infeasibility_hints"] = _infeasibility_hints(candidates, eff_caps, bool(require_on_time), carbon_cap)
-        return _empty_result(run["status"], weights_used, assumptions, diagnostics)
+    if result_run["status"] not in SUCCESS_STATUSES:
+        if result_run["status"] == STATUS_INFEASIBLE:
+            diagnostics["infeasibility_hints"] = _infeasibility_hints(weekly, orders, week_limits, require_on_time, carbon_cap)
+        return _empty_result(result_run["status"], weights_used, assumptions, diagnostics)
 
-    chosen_rows = candidates.loc[run["chosen"]]
-    issues = run["extraction_problems"] or _post_solve_checks(chosen_rows, eff_caps, carbon_cap, bool(require_on_time))
+    chosen_rows = weekly.loc[result_run["chosen"]]
+    issues = result_run["extraction_problems"] or _post_solve_checks(chosen_rows, week_limits, carbon_cap, require_on_time)
     if issues:
         diagnostics["errors"] = issues
         return _empty_result(STATUS_ERROR, weights_used, assumptions, diagnostics)
 
-    utilisation, loads = _utilisation(chosen_rows, eff_caps)
-    diagnostics["plant_load_units"] = loads
-    late_rows = chosen_rows.loc[chosen_rows["is_late"].fillna(False).astype(bool)]
+    status = result_run["status"]
+    unassigned = _unassigned_records(orders, weekly, result_run["unassigned"], require_on_time)
+    if unassigned:
+        status = STATUS_PARTIAL
+        diagnostics["infeasibility_hints"] = _infeasibility_hints(weekly, orders, week_limits, require_on_time, carbon_cap)
+
+    usage = _utilisation(chosen_rows, week_limits, week_starts)
+    diagnostics.update({k: v for k, v in usage.items() if k != "plant_utilisation"})
+    late_rows = chosen_rows.loc[chosen_rows["is_late"]]
     total_carbon = math.fsum(chosen_rows["total_carbon_kg"])
 
     return to_json_compatible({
-        "status": run["status"],
+        "status": status,
         "allocation": _allocation_records(chosen_rows),
+        "unassigned_orders": unassigned,
         "total_cost": math.fsum(chosen_rows["total_cost"]),
         "total_carbon_kg": total_carbon,
         "total_carbon_t": kg_to_tonnes(total_carbon),
         "late_orders": int(len(late_rows)),
         "late_order_ids": late_rows["order_id"].tolist(),
-        "plant_utilisation": utilisation,
+        "plant_utilisation": usage["plant_utilisation"],
         "weights_used": weights_used,
-        "objective_value": run["objective_value"],
+        "objective_value": result_run["objective_value"],
         "assumptions": assumptions,
         "diagnostics": diagnostics,
     })
