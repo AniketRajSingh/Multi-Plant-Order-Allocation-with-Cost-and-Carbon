@@ -4,6 +4,36 @@ Every change Claude Code makes in this repo is listed here, newest first, with w
 
 ---
 
+## 2026-10-11: Replace hard-coded orchestrator tools with Sunandini's solver + DuckDB data
+
+**Asked for:** fetch Sunandini's commit and use the database instead of the hard-coded values.
+
+### Pulled
+- Merged `origin/main` (`90a39a3`). It brings 4 commits from Sunandini: `app/solver/` with `cost_carbon.py` (landed-cost and carbon formulas), `milp.py` (PuLP/CBC MILP), `validator.py` (independent Annex A checker) and `tradeoff.py` (carbon-cut curve and weight sweep), plus `tests/test_solver.py`.
+- **Her commit has the solver but no data CSVs.** `data/allocation.duckdb` is still empty, so `/analyze` now answers "Cannot plan: no data loaded…" until data is loaded.
+
+### Environment finding
+- With PuLP 4.0, 19 of Sunandini's 79 tests fail: `LpVariable(cat=...)` was removed in 4.0. With **PuLP 2.9.0** all 79 pass. I installed 2.9.0 locally.
+- **TODO (not committed):** add `pulp==2.9.0` to `requirements.txt`. The user asked me not to commit configuration files, so this is left for the team. The Docker image will not have the solver until it is added.
+
+### Files changed
+| File | Change |
+|---|---|
+| `app/orchestrator/tools.py` (new) | Real tools. `tool_solve_allocation` loads orders, plants and transport_duties from DuckDB and calls `solve_allocation` and `generate_tradeoff_curve` (0/5/10/15/20% carbon cut). It turns scenario capacity losses into retained fractions; a "re-plan" with no plant given applies the loaded `capacity_events` that overlap the planning week. `tool_validate_plan` calls Sunandini's validator on the raw tables. `tool_compare_plans` re-solves the base plan and diffs it (extra cost/carbon, moved orders, utilisation shifts). `tool_diagnose_order` gives per-plant cost, carbon, arrival, duty and spare capacity for "why order X in plant Y" questions; it accepts `O-077`, `77` or `077`. `solve_partial_allocation` is the closest-option plan when the full plan is infeasible: it maximises units allocated, then minimises late orders, then cost and carbon, and lists the unmet orders. |
+| `app/orchestrator/graph.py` | Removed the 4 hard-coded tool functions (1,840,000 / 71,000 / O-077 values). The nodes now call `tools.py`. The trace now records the data rows used, capacity overrides, planning date, KPIs and solve time. Added a `no_plan` node: when data is missing or no plan exists, it returns `clarification_needed` or `infeasible` instead of a brief full of zeros. The diagnosis node now solves the plan and uses the order id the router extracted. |
+| `app/orchestrator/prompts.py` | Rewrote the deterministic brief. It now handles scenario, why-order and infeasible answers separately; before, a why-order answer printed "extra cost $0.00". Signed deltas, moved-order list, per-plant options. Removed the claim "carbon factors based on regional grid averages", which the data does not support. |
+| `app/api/schemas.py` | Added `why_order` to `AnswerType`. Aniket's router emits it, so without this `/analyze` would fail validation on "why" questions. |
+| `app/api/routes.py` | The summary for why-order answers is built from the diagnosis reasons. |
+| `app/db/database.py` | Added `set_db()` so tests can point the tools at a fixture database. |
+| `tests/fixtures.py` (new) | Small synthetic pack with the Section 4.4 traps: cheapest plant late (O-001, O-007), single-plant product (O-003/P2), duty trap (A→US 40%), low-carbon low-capacity Plant C, and capacity event E-1 (B −30%). |
+
+### Verification
+- `python -m pytest tests -q`: **108 passed, 2 failed.**
+- The 2 failures are `test_orchestrator.py::TestGraphPipeline::test_run_scenario_pipeline` and `test_run_why_order_pipeline`. These are Aniket's tests: they assert the old hard-coded output (`extra_cost == 71000`) and run against the empty database. **Next step:** point them at `tests/fixtures.demo_db()` with `set_db()` and `PLANNING_START=2026-10-12`, and assert real computed values. The user stopped this step and asked for a commit.
+- Not yet checked end to end through `/analyze` with loaded data.
+
+---
+
 ## 2026-10-11: Commit and pull from origin/main
 
 - Committed the API/DB/loader/Docker work as 7 commits (`8e4867f`..`61e4c32`).
