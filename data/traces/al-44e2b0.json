@@ -1,0 +1,47 @@
+{
+  "run_id": "al-44e2b0",
+  "request": "Why is order O-077 arriving late if allocated to Plant A?",
+  "steps": [
+    {
+      "agent": "router",
+      "tool": "classify_intent",
+      "input": {
+        "request": "Why is order O-077 arriving late if allocated to Plant A?"
+      },
+      "output": {
+        "intent": "diagnosis",
+        "confidence": 0.94
+      }
+    },
+    {
+      "agent": "diagnostician",
+      "tool": "diagnose_order",
+      "input": {
+        "order_id": "O-077",
+        "candidate_plant": "A"
+      },
+      "output": {
+        "cheapest_plant": "A",
+        "cheapest_cost": 17400,
+        "transit_days": 7,
+        "days_late": 3,
+        "on_time_alternative": "C",
+        "alternative_cost": 18200
+      }
+    },
+    {
+      "agent": "checker",
+      "tool": "validate_plan",
+      "output": {
+        "delivery_ok": false,
+        "violation": "Order O-077 misses due date by 3 days at Plant A"
+      }
+    },
+    {
+      "agent": "writer",
+      "tool": "write_brief"
+    }
+  ],
+  "llm_calls": 1,
+  "tokens": 1280
+}

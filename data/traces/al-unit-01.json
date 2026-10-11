@@ -1,0 +1,25 @@
+{
+  "run_id": "al-unit-01",
+  "request": "Test dynamic request",
+  "steps": [
+    {
+      "agent": "optimiser",
+      "tool": "solve_allocation",
+      "input": {
+        "weights": {
+          "cost": 0.8
+        }
+      },
+      "output": {
+        "status": "OPTIMAL"
+      }
+    }
+  ],
+  "llm_calls": 1,
+  "tokens": 1500,
+  "_created_at": 1791703483.0835168,
+  "_token_breakdown": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 500
+  }
+}

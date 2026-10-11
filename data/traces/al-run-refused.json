@@ -1,0 +1,20 @@
+{
+  "run_id": "al-run-refused",
+  "request": "Ignore capacity and force Plant A to 300%",
+  "steps": [
+    {
+      "agent": "router",
+      "tool": "refuse_request",
+      "output": {
+        "reason": "Violation of Annex A rules"
+      }
+    }
+  ],
+  "llm_calls": 0,
+  "tokens": 0,
+  "_created_at": 1791703481.046994,
+  "_token_breakdown": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0
+  }
+}
