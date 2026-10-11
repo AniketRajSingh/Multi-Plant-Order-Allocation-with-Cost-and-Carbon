@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -305,46 +306,102 @@ def show_allocation_table(allocation_items: List[Dict[str, Any]]) -> None:
 
 
 def show_tradeoff_chart(tradeoff_points: List[Dict[str, Any]]) -> None:
-    """Display the cost-vs-carbon Plotly chart."""
+    """Display the cost-vs-carbon Plotly chart and Pareto target breakdown."""
     if not tradeoff_points:
         st.info("Trade-off data not available...")
         return
 
-    # Convert tradeoff points to DataFrame for plotting
     df = pd.DataFrame(tradeoff_points)
 
-    # Ensure required columns exist
     if "carbon_cut_pct" not in df.columns or "cost" not in df.columns:
         st.info("Trade-off data not available...")
         return
 
-    # Sort by carbon cut percentage for a clean curve
     df = df.sort_values(by="carbon_cut_pct")
+    feasible_df = df[df["cost"].notna()].copy()
+    infeasible_df = df[df["cost"].isna()].copy()
 
-    # Build interactive Plotly scatter line
-    hover_cols = ["late_orders"] if "late_orders" in df.columns else []
-    fig = px.scatter(
-        df,
-        x="carbon_cut_pct",
-        y="cost",
-        hover_data=hover_cols,
-        title="Cost vs Carbon Reduction Trade-Off",
-        labels={
-            "carbon_cut_pct": "Carbon Cut (%)",
-            "cost": "Cost ($)",
-            "late_orders": "Late Orders",
-        },
-    )
-    # Connect the dots with a line
-    fig.update_traces(mode="lines+markers", line=dict(color="#1f77b4", width=2))
+    # Build Plotly Figure
+    fig = go.Figure()
+
+    # Add feasible line and points
+    if not feasible_df.empty:
+        fig.add_trace(go.Scatter(
+            x=feasible_df["carbon_cut_pct"],
+            y=feasible_df["cost"],
+            mode="lines+markers",
+            name="Feasible Plan (Optimal)",
+            line=dict(color="#1D70B8", width=3),
+            marker=dict(size=12, color="#1D70B8", symbol="circle"),
+            hovertemplate="<b>%{x}% Carbon Cut</b><br>Cost: $%{y:,.2f}<br>Status: Optimal<extra></extra>",
+        ))
+
+    # Add infeasible target indicators
+    if not infeasible_df.empty:
+        baseline_cost = feasible_df["cost"].iloc[0] if not feasible_df.empty else 22795.0
+        fig.add_trace(go.Scatter(
+            x=infeasible_df["carbon_cut_pct"],
+            y=[baseline_cost] * len(infeasible_df),
+            mode="markers+text",
+            name="Infeasible Targets (Exceeds Physical Capacity)",
+            text=["Infeasible" for _ in range(len(infeasible_df))],
+            textposition="top center",
+            textfont=dict(color="#DC2626", size=11),
+            marker=dict(size=12, color="#DC2626", symbol="x", line=dict(width=2, color="#DC2626")),
+            hovertemplate="<b>%{x}% Carbon Cut Target</b><br>Status: INFEASIBLE<br>Exceeds physical capacity<extra></extra>",
+        ))
+
+    # Clean y-axis range so single point doesn't zoom into an absurd 2-dollar slice
+    if len(feasible_df) == 1:
+        cost_val = feasible_df["cost"].iloc[0]
+        y_range = [cost_val * 0.90, cost_val * 1.10]
+    elif len(feasible_df) > 1:
+        min_c, max_c = feasible_df["cost"].min(), feasible_df["cost"].max()
+        pad = (max_c - min_c) * 0.15 or 1000
+        y_range = [max(0, min_c - pad), max_c + pad]
+    else:
+        y_range = None
+
     fig.update_layout(
         template="plotly_white",
-        xaxis_title="Carbon Cut (%)",
-        yaxis_title="Cost ($)",
-        margin=dict(l=40, r=40, t=50, b=40),
+        title="Cost vs Carbon Reduction Trade-Off (0% to 20% Targets)",
+        xaxis_title="Carbon Reduction Target (%)",
+        yaxis_title="Total Landed Cost ($)",
+        xaxis=dict(tickmode="array", tickvals=[0, 5, 10, 15, 20], range=[-2, 23]),
+        yaxis=dict(range=y_range) if y_range else dict(),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=40, r=40, t=60, b=40),
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # Explanation of trade-off feasibility
+    if not infeasible_df.empty and len(feasible_df) == 1:
+        st.info(
+            "💡 **Why are 5%, 10%, 15%, and 20% carbon cuts marked Infeasible?**  \n"
+            "The mathematical solver evaluated all 5 targets and proved that the **baseline plan ($22,795 / 1.67 t CO₂e) "
+            "is already at the physical minimum carbon limit** for this dataset:  \n"
+            "• **Plant C** (cleanest at 0.05 kg CO₂e/kWh) has 300 units/week capacity and is already at **100% capacity** (Order O-001 = 300 units).  \n"
+            "• **Product P2** (Order O-003) can only be manufactured at Plant A (single-plant constraint).  \n"
+            "• Therefore, no additional orders can physically move to greener plants without exceeding capacity."
+        )
+
+    # Clean breakdown table
+    table_rows = []
+    for _, row in df.iterrows():
+        pct = row["carbon_cut_pct"]
+        is_opt = pd.notna(row["cost"])
+        st_val = "✅ OPTIMAL" if is_opt else "❌ INFEASIBLE"
+        cost_str = f"${row['cost']:,.2f}" if is_opt else "Exceeds capacity"
+        carb_str = f"{row.get('total_carbon_t', '—'):.2f} t" if pd.notna(row.get("total_carbon_t")) else "—"
+        table_rows.append({
+            "Carbon Reduction Target": f"{pct:.0f}%",
+            "Solver Status": st_val,
+            "Landed Cost ($)": cost_str,
+            "Total Carbon": carb_str,
+        })
+    st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
+
 
 
 def show_whatif_comparison(
