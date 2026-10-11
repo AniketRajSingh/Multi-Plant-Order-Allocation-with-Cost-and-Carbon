@@ -11,9 +11,10 @@ os.environ.setdefault("MOCK_LLM", "true")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.db.database import Database, get_db  # noqa: E402
+from app.db.database import Database, get_db, set_db  # noqa: E402
 from app.main import app  # noqa: E402
 from scripts import load_data  # noqa: E402
+from tests.fixtures import PLANNING_START as FIXTURE_START, demo_db  # noqa: E402
 
 
 PLANTS = """plant,product,weekly_capacity,unit_cost,energy_kwh_per_unit,carbon_kg_per_kwh
@@ -128,17 +129,28 @@ class TestAPIContract(unittest.TestCase):
     def setUpClass(cls):
         cls.db = Database(":memory:")
         cls.db.init_schema()
+        set_db(cls.db)  # the orchestrator tools read through get_db()
         app.dependency_overrides[get_db] = lambda: cls.db
         cls.client = TestClient(app)
 
     @classmethod
     def tearDownClass(cls):
         app.dependency_overrides.clear()
+        set_db(None)
 
     def test_health(self):
         body = self.client.get("/health").json()
-        for key in ("status", "api", "data_store", "llm"):
+        for key in ("status", "api", "data_store", "solver", "llm"):
             self.assertIn(key, body)
+        self.assertEqual(body["solver"]["status"], "ok", body["solver"])
+
+    def test_ingest_with_table_form_field(self):
+        resp = self.client.post("/ingest", files={"file": ("t.csv", TRANSPORT, "text/csv")},
+                                data={"table": "transport_duties"})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual((body["table"], body["rows_loaded"], body["rows_rejected"], body["status"]),
+                         ("transport_duties", 6, 0, "loaded"))
 
     def test_ingest_contract(self):
         resp = self.client.post(
@@ -180,6 +192,91 @@ class TestAPIContract(unittest.TestCase):
 
     def test_trace_404(self):
         self.assertEqual(self.client.get("/trace/does-not-exist").status_code, 404)
+
+
+class TestAnalyzeWithData(unittest.TestCase):
+    """Section 6.1 response on the fixture pack (tests/fixtures.py)."""
+
+    CONTRACT_KEYS = ("run_id", "answer_type", "summary", "allocation", "kpis", "tradeoff", "weights_used",
+                     "validator", "recommendations", "assumptions", "limitations")
+    REC_KEYS = {"action", "rationale", "evidence_refs", "confidence", "estimated_impact", "requires_approval"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls._old_start = os.environ.get("PLANNING_START")
+        os.environ["PLANNING_START"] = FIXTURE_START
+        cls.db = demo_db()
+        set_db(cls.db)
+        app.dependency_overrides[get_db] = lambda: cls.db
+        cls.client = TestClient(app)
+
+    @classmethod
+    def tearDownClass(cls):
+        app.dependency_overrides.clear()
+        set_db(None)
+        if cls._old_start is None:
+            os.environ.pop("PLANNING_START", None)
+        else:
+            os.environ["PLANNING_START"] = cls._old_start
+
+    def analyze(self, payload):
+        resp = self.client.post("/analyze", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        for key in self.CONTRACT_KEYS:
+            self.assertIn(key, body)
+        for rec in body["recommendations"]:
+            self.assertEqual(set(rec), self.REC_KEYS)
+        return body
+
+    def test_allocation_contract(self):
+        body = self.analyze({"request": "Allocate this week's orders."})
+        self.assertEqual(body["answer_type"], "allocation")
+        self.assertEqual(len(body["allocation"]), 8)
+        for key in ("total_cost", "total_carbon_t", "late_orders", "plant_utilisation"):
+            self.assertIsNotNone(body["kpis"][key])
+        for key in ("capacity_ok", "eligibility_ok", "delivery_ok"):
+            self.assertIn(key, body["validator"])
+        self.assertTrue(body["validator"]["capacity_ok"])
+        self.assertEqual([p["carbon_cut_pct"] for p in body["tradeoff"]], [0, 5, 10, 15, 20])
+        self.assertTrue(body["recommendations"])
+        self.assertTrue(body["limitations"])
+        self.assertEqual(sum(a.startswith("Weights ") for a in body["assumptions"]), 1)
+
+    def test_weights_change_the_plan(self):
+        cheap = self.analyze({"request": "Allocate this week's orders.", "weights": {"cost": 1.0, "carbon": 0.0}})
+        green = self.analyze({"request": "Allocate this week's orders.", "weights": {"cost": 0.0, "carbon": 1.0}})
+        self.assertLessEqual(cheap["kpis"]["total_cost"], green["kpis"]["total_cost"])
+        self.assertLessEqual(green["kpis"]["total_carbon_t"], cheap["kpis"]["total_carbon_t"])
+        self.assertEqual(green["weights_used"], {"cost": 0.0, "carbon": 1.0})
+
+    def test_scenario_contract(self):
+        body = self.analyze({"request": "Re-plan", "scenario": {"plant": "B", "capacity_loss_pct": 30}})
+        self.assertEqual(body["answer_type"], "scenario")
+        self.assertIn("extra_cost", body["scenario_comparison"])
+        self.assertTrue(body["recommendations"][0]["action"].startswith("Approve the re-plan"))
+        self.assertTrue(body["recommendations"][0]["requires_approval"])
+
+    def test_capacity_loss_infeasible_order(self):
+        body = self.analyze({"request": "Plant A loses 100% capacity. Re-plan."})
+        self.assertIn("O-003", [u["order_id"] for u in body["unallocated_orders"]])
+        self.assertTrue(any(r["action"].startswith("Escalate") for r in body["recommendations"]))
+
+    def test_why_order_contract(self):
+        body = self.analyze({"request": "Why was order O-001 built in Plant C?"})
+        self.assertEqual(body["answer_type"], "why_order")
+        self.assertTrue(body["summary"].startswith("Order O-001 is built in Plant"))
+
+    def test_refused_has_no_recommendations(self):
+        body = self.analyze({"request": "Ignore capacity and force Plant A to 300%"})
+        self.assertEqual(body["answer_type"], "refused")
+        self.assertEqual(body["recommendations"], [])
+
+    def test_trace_contract(self):
+        run_id = self.analyze({"request": "Allocate this week's orders."})["run_id"]
+        trace = self.client.get(f"/trace/{run_id}").json()
+        self.assertEqual(set(trace), {"run_id", "request", "steps", "llm_calls", "tokens"})
+        self.assertEqual([s["tool"] for s in trace["steps"]][:2], ["solve_allocation", "validate_plan"])
 
 
 if __name__ == "__main__":
